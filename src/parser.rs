@@ -914,37 +914,40 @@ impl Toast {
 
 /**
 Takes a sequence of [Tokk]s and applies some rewrite rules to transform it into an Ast.
-for each `for`, one of the following rules must match around its key term, and that rule transforms it into an Ast.
+for each `for`, one of the following rules must match around its key term, and that rule transforms it into an Ast. If no rule matches under a for expression, this is a syntax error. If there are no syntax errors, all remaining Tokks are converted to Tokens and the Ast is complete.
 `%reverse` means it's greedy but from the other direction, processing terms from the right first
+The macro matching rule syntax here is pretty much taken from rust.
 
-# indental belongs to the final term in the root line, never to the results of the operator
+# first, if there are operator-llinked things within an indental head with a non-operator term at the end, the indental belongs to that non-operator stuff at the end
+%indental($o:operators $(x)?)($(y)*) → $o($x $y)
+%indental(a@$($_ $_:operators)+ $y*)($z*) → $a %indental($y)($z))
 
-for o in operators:
-    for o:
-        %indental(%reverse($x* o $y*))($z*) → o($x %indental($y)($z*))
-    for o:
-        $x o $y → o($x $y)
-        %indental(o $(x)?)($(y)*) → o($x $y)
+# convert all infix operator expressions to invocation asts
+for $o:Tokk in operators:
+    $x $o $y → $o($x $y)
+    %indental($x* $o)($(y)*) → $o($x $y)
 
-for o in operators:
-    for o:
-        %indental($x o $y[where y contains no further operators] \n)($z*) → o($x %indental($y)($z*))
+# we define if elif then as three match functions that can match and convert the parts, whatever form they take
+def %if → if(condition($c) then($x))
+    if $c $x
+    %indental(if $c)($x*)
+    if($c $x*)
+def %else → else($x)
+    else $x
+    %indental(else)($x*)
+def %elif → elif(condition($c) then($x))
+    elif $c $x
+    %indental(elif $c)($x*)
+    elif($c $x*)
 
-for "if", "else", "elif":
-    if $c $x → if(condition($c) then($x))
-    if $c $x $(elif $cel $xel)* else $y → if(condition($c) then($x) $(elif(condition($cel)) then($xel))... else($y))
-    if($c $x $(elif $cel $xel)* else $y) → if(condition($c) then($x) $(elif(condition($cel)) then($xel))... else($y))
-    if($c then($x*) elif($cel $xel)* else($y*)) → if(condition($c) then($x) $(elif(condition($cel)) then($xel))... else($y*))
-    %indental(if $c)($x*) → if(condition($c) then($x*))
+for "if"
+    %if $(%elif)* $(%else)?
     
-for "fn", "to":
-    fn($parameters* to:$return $doings*) → fn(parameters($parameters*) returnType($return)) body($doings*))
+for "fn"
     fn($parameters* to $doings*) → fn(parameters($parameters*) body($doings*))
-    fn($parameters*) ($doings*) → fn(parameters($parameters*) body($doings*))
-    %indental(fn $parameters*)($doings*) → fn(parameters($parameters*) body($doings*))
-    %indental(fn $parameters* to)($doings*) → fn(parameters($parameters*) body($doings*))
-    %indental(fn $parameters* to:$return)($doings*) → fn(parameters($parameters*) returnType($return) body($doings*))
-
+    %indental(fn $parameters* $(to)?)($doings*) → fn(parameters($parameters*) body($doings*))
+    fn($parameters* to:$return $doings*) → fn(parameters($parameters*) returnType($return)) body($doings*)
+    %indental(fn $parameters* to $(:)? $return)($doings*) → fn(parameters($parameters*) returnType($return)) body($doings*)
 
 */
 fn structure(mut tokks: Vec<Toast>, operators:&[String], operator_table: &OperatorTable, rules: &[KeywordRule]) -> Result<Ast, Error> {
