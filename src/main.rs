@@ -48,23 +48,17 @@ impl<T: ?Sized> Ref<T> {
 }
 
 
-
-/// a frontier at which interpretation is being done, but will pause whenever it encounters a reference to a value that is not yet defined.
-struct Frontier {
-    r: Ref,
-}
-
 /// it's not efficient or anything, it's just a simple map for representing possibly graphic data.
-struct Arena {
+pub struct Arena {
     values: HashMap<Ref<dyn Any>, Box<dyn Any>>,
 }
 impl Arena {
-    fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             values: HashMap::new(),
         }
     }
-    fn get<T: 'static>(&self, r: Ref<T>) -> Result<&T, Error> {
+    pub fn get<T: 'static>(&self, r: Ref<T>) -> Result<&T, Error> {
         self.values
             .get(&r.erase())
             .ok_or(Error::new(
@@ -78,15 +72,23 @@ impl Arena {
                 ))
             })
     }
-    fn create<T: 'static>(&mut self, value: T) -> Ref {
+    pub fn create<T: 'static>(&mut self, value: T) -> Ref {
         let r: Ref = Ref(self.values.len() as u64, PhantomData);
         self.values.insert(r.clone(), Box::new(value));
         r
     }
-    fn remove(&mut self, r: Ref)-> Option<Box<dyn Any>> {
+    pub fn remove(&mut self, r: Ref)-> Option<Box<dyn Any>> {
         self.values.remove(&r)
     }
 }
+
+
+/// a frontier at which interpretation is being done, but will pause whenever it encounters a reference to a value that is not yet defined.
+struct Frontier {
+    r: Ref,
+}
+
+
 
 /// I think I want this to be typed objects? Idk, why? The compiler/interpreter doesn't need them to be, but you want to distribute this as a kind of well defined binary format.
 /// so this can be thought of as a reduced shadow of a typed object graph format.

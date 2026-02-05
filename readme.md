@@ -1,6 +1,8 @@
 Attempts to make a programming language.
 
-What's here so far, just a parser, however, it's the perfect parser. It consists entirely of a minimalistic conversion from raw text to structured tokens, and then just 15 rewrite rules which convert the parts into simple AST nodes. The final syntax has infix operators, negotiable whitespace structuring, and no need of semicolons or even commas.
+What's here so far, just a parser, however, it's the perfect parser. It consists entirely of a minimalistic conversion from raw text to structured tokens, and then just 16 rewrite rules in mostly one pass which convert the parts into simple AST nodes.
+
+The default syntax ("language") has infix operators, negotiable whitespace structuring, and no need of semicolons or even commas.
 
 The syntax is like this:
 
@@ -30,3 +32,14 @@ ac =
     else 0
 ```
 
+Later on I'll be attempting type checking. Types with with full static evaluation, generics, value parameters, variance, maybe type inference but that's not what I want to think about just now, but it's going to need it if it is to be anything.
+
+And then garbage collection, note to self, go and see how Deno does it.
+
+And then wasm compilation.
+
+And then a very nice self-describing hash addressable object format.
+
+And then a database/OS and editor.
+
+And then some killer apps.

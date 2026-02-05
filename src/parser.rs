@@ -1,7 +1,11 @@
+
+
 // overview: This is a very flexible parser for languages that may or may not use indentation to structure, which have a fixed number of infix operators, with precedence. This was entirely sufficient to implement the quite sophisticated syntax of the ~~Bjork~~Kaba language.
 // the tokenizer converts a string into Scrips, which are sometimes like tokens, other times richer and more structured, as they can retain indent structure. The Scrips are then transformed through term rewriting into Asts.
 // keywords: fn, to, if, else, elif
 
+
+use crate::{Ref, Arena};
 /*
 The example input:
 
@@ -69,7 +73,8 @@ pub enum QuoteType {
 pub enum TokkV {
     Token(String),
     Quoted(QuoteType, String),
-    Parens(ParenType, Vec<Toast>),
+    /// Invocation: paren type, optional caller (the token before the paren), and arguments
+    Invocation(ParenType, Option<Box<Toast>>, Vec<Toast>),
     Indental {
         root_line: Vec<Toast>,
         indented: Vec<Toast>,
@@ -78,34 +83,37 @@ pub enum TokkV {
 
 /// Tracks the content accumulated at a given indentation level
 struct IndentLevel {
-    /// The whitespace prefix string for this indent level
-    whitespace: String,
+    /// Length of the indent prefix within the parent InvocationLevel's known_indent
+    indent_len: usize,
     /// The scrips accumulated at this indent level (the root line, before any sub-indent)
     root_line: Vec<Toast>,
     /// The scrips accumulated in indented sub-content
     indented: Vec<Toast>,
-    /// Whether we've moved past the root line into indented content
-    in_indented: bool,
     /// Span start for this indent level
     span_start: usize,
 }
 
-/// tracks open parentheses and their associated indent state
-struct ParenLevel {
+/// Tracks open invocations (paren groups) and their associated indent state
+struct InvocationLevel {
     /// None for root level, Some for actual parens
     paren_type: Option<ParenType>,
+    /// The token that preceded the opening paren (the "caller"), if any
+    caller: Option<Toast>,
     span_start: usize,
-    /// Indent stack for this paren level
+    /// The known indent string - extended as indent_stack grows, shortened as it pops
+    known_indent: String,
+    /// Indent stack for this invocation level
     indent_stack: Vec<IndentLevel>,
-    /// Content accumulated inside this paren
+    /// Content accumulated inside this invocation
     content: Vec<Toast>,
 }
 
-impl ParenLevel {
-    /// Get the current output destination within this paren entry
+impl InvocationLevel {
+    /// Get the current output destination within this invocation level.
+    /// Uses `indented` if it's non-empty (meaning we've seen sub-content), otherwise `root_line`.
     fn get_output(&mut self) -> &mut Vec<Toast> {
         if let Some(indent) = self.indent_stack.last_mut() {
-            if indent.in_indented {
+            if !indent.indented.is_empty() {
                 &mut indent.indented
             } else {
                 &mut indent.root_line
@@ -129,7 +137,7 @@ impl ParenLevel {
 }
 
 /// Finalize a popped indent level, either merging or creating an Indental
-fn finalize_indent_level(paren: &mut ParenLevel, finished: IndentLevel, end_pos: usize) {
+fn finalize_indent_level(paren: &mut InvocationLevel, finished: IndentLevel, end_pos: usize) {
     finalize_indent_level_into(
         &mut paren.indent_stack,
         &mut paren.content,
@@ -145,19 +153,16 @@ fn finalize_indent_level_into(
     finished: IndentLevel,
     end_pos: usize,
 ) {
-    if finished.indented.is_empty() && !finished.in_indented {
-        // No indented content, merge root_line into parent
+    if finished.indented.is_empty() {
+        // No sub-content at this level - just merge root_line into parent's indented
+        // (since this level was sub-content of the parent)
         if let Some(parent) = indent_stack.last_mut() {
-            if parent.in_indented {
-                parent.indented.extend(finished.root_line);
-            } else {
-                parent.root_line.extend(finished.root_line);
-            }
+            parent.indented.extend(finished.root_line);
         } else {
             content.extend(finished.root_line);
         }
     } else {
-        // Create an Indental
+        // Has sub-content, create an Indental
         let tokk = Toast::Tokk(Tokk {
             span: Span::from_range(finished.span_start, end_pos),
             content: TokkV::Indental {
@@ -166,11 +171,7 @@ fn finalize_indent_level_into(
             },
         });
         if let Some(parent) = indent_stack.last_mut() {
-            if parent.in_indented {
-                parent.indented.push(tokk);
-            } else {
-                parent.root_line.push(tokk);
-            }
+            parent.indented.push(tokk);
         } else {
             content.push(tokk);
         }
@@ -214,7 +215,11 @@ impl ParenType {
     }
 }
 
+mod ast {
+    use crate::parser::Span;
+
 #[derive(Debug)]
+/// AL is [Ast] node Link type. Before the parser it'll be [Toast]s, after the parser it'll be Box<Ast>s. During type checking you'll probably want it to be graph node ids.
 pub struct Ast {
     pub span: Span,
     pub v: AstV,
@@ -247,14 +252,14 @@ struct Conditional {
 pub struct Invocation {
     pub span: Span,
     pub head: String,
-    pub parentheticals: Vec<Vec<Box<Ast>>>,
+    pub parentheticals: Vec<Vec<Ast>>,
 }
 
 #[derive(Debug)]
 pub struct Operator {
     pub span: Span,
     pub name: String,
-    pub arguments: Vec<Box<Ast>>,
+    pub arguments: Vec<Ast>,
 }
 
 #[derive(Debug)]
@@ -268,7 +273,9 @@ pub struct Atom {
     pub span: Span,
     pub value: String,
 }
+}
 
+pub use ast::Ast;
 
 #[derive(Debug)]
 pub struct Error {
@@ -439,10 +446,12 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
     let mut pos: usize = 0;
     let mut chars: Peekable<Chars> = source.chars().peekable();
 
-    // Stack of open parentheses - bottom entry (None type) is never popped
-    let mut paren_stack: Vec<ParenLevel> = vec![ParenLevel {
+    // Stack of open invocations - bottom entry (None type) is never popped
+    let mut invocation_stack: Vec<InvocationLevel> = vec![InvocationLevel {
+        caller: None,
         paren_type: None,
         span_start: 0,
+        known_indent: String::new(),
         indent_stack: Vec::new(),
         content: Vec::new(),
     }];
@@ -453,20 +462,33 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
     while chars.peek().is_some() {
         // Handle line starts - measure indentation
         if at_line_start {
-            // Collect leading whitespace as a string
             let indent_start = pos;
-            let mut indent_ws = String::new();
+            let current = invocation_stack.last_mut().unwrap();
+            let base_len = if let Some(l) = current.indent_stack.last() { l.indent_len } else { 0 };
+            
+            // Read whitespace, comparing against known_indent and extending if deeper
+            let mut new_len = 0;
+            let mut mismatch_at: Option<usize> = None;
+            
             loop {
                 match chars.peek() {
-                    Some(&' ') => {
+                    Some(&' ') | Some(&'\t') => {
+                        let c = *chars.peek().unwrap();
                         chars.next();
                         pos += 1;
-                        indent_ws.push(' ');
-                    }
-                    Some(&'\t') => {
-                        chars.next();
-                        pos += 1;
-                        indent_ws.push('\t');
+                        
+                        if new_len < base_len {
+                            // Compare against existing pattern
+                            if current.known_indent.as_bytes()[new_len] != c as u8 {
+                                if mismatch_at.is_none() {
+                                    mismatch_at = Some(new_len);
+                                }
+                            }
+                        } else {
+                            // Extending beyond base - add to known_indent
+                            current.known_indent.push(c);
+                        }
+                        new_len += 1;
                     }
                     Some(&'\r') => {
                         // Empty line - consume and restart
@@ -476,15 +498,18 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                             chars.next();
                             pos += 1;
                         }
-                        indent_ws.clear();
-                        // Continue measuring from start of next line
+                        // Reset any extension we made
+                        current.known_indent.truncate(base_len);
+                        new_len = 0;
+                        mismatch_at = None;
                     }
                     Some(&'\n') => {
                         // Empty line - consume and restart
                         chars.next();
                         pos += 1;
-                        indent_ws.clear();
-                        // Continue measuring from start of next line
+                        current.known_indent.truncate(base_len);
+                        new_len = 0;
+                        mismatch_at = None;
                     }
                     _ => break,
                 }
@@ -496,66 +521,68 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                 break;
             }
 
-            // Check if the first non-whitespace char is a closing bracket.
-            // If so, skip indent processing - the bracket will close the current paren,
-            // and any remaining content belongs to the outer context.
+            // Check if the first non-whitespace char is a closing bracket, abandon indenting if so
             let next_char = chars.peek();
-            let is_closing_bracket = matches!(next_char, Some(')') | Some(']') | Some('}'));
+            let is_bracket = matches!(next_char, Some(')') | Some(']') | Some('}') | Some('(') | Some('[') | Some('{'));
             
-            if !is_closing_bracket {
-                // Now handle indent level changes for the current paren level
-                let current_paren = paren_stack.last_mut().unwrap();
-
-                // Compare new indent with current indent levels using prefix matching
-                // Pop levels where the new indent is not an extension of them
-                while let Some(top) = current_paren.indent_stack.last() {
-                    if indent_ws == top.whitespace {
-                        // Same indent level
-                        if top.in_indented {
-                            // Same level but already had indented content = new block
-                            // Pop and finalize
-                            let finished = current_paren.indent_stack.pop().unwrap();
-                            finalize_indent_level(current_paren, finished, pos);
-                        } else {
-                            // Continue in same block
-                            break;
-                        }
-                    } else if indent_ws.starts_with(&top.whitespace) {
-                        // New indent is deeper (extends current) - will push new level below
-                        break;
-                    } else if top.whitespace.starts_with(&indent_ws) {
-                        // Dedenting - new indent is a prefix of current, pop this level
-                        let finished = current_paren.indent_stack.pop().unwrap();
-                        finalize_indent_level(current_paren, finished, pos);
-                    } else {
-                        // Neither is a prefix of the other - inconsistent indentation error
+            if is_bracket {
+                // Closing bracket - truncate any extension
+                current.known_indent.truncate(base_len);
+            }else{
+                // Check for inconsistent indentation (mismatch within the prefix we should match)
+                if let Some(mm) = mismatch_at {
+                    // Mismatch at position mm - check if we're dedenting to a level <= mm
+                    // Find if any level has indent_len <= mm
+                    let valid_dedent = current.indent_stack.iter()
+                        .any(|l| l.indent_len <= mm);
+                    
+                    if !valid_dedent || new_len > mm {
                         return Err(Error::new(
-                            Span::new(indent_start, indent_ws.len().max(1)),
+                            Span::new(indent_start, new_len.max(1)),
                             "Inconsistent indentation: whitespace pattern doesn't match previous levels",
                         ));
                     }
                 }
 
-                // Check if we need to create a new indent level
-                if let Some(top) = current_paren.indent_stack.last_mut() {
-                    if indent_ws.starts_with(&top.whitespace) && indent_ws != top.whitespace {
-                        // Deeper indent - mark current as having indented content
-                        top.in_indented = true;
-                        current_paren.indent_stack.push(IndentLevel {
-                            whitespace: indent_ws,
-                            root_line: Vec::new(),
-                            indented: Vec::new(),
-                            in_indented: false,
-                            span_start: pos,
-                        });
+                // Pop levels where new_len is less than their indent_len
+                while let Some(top) = current.indent_stack.last() {
+                    if new_len < top.indent_len {
+                        // Dedenting past this level
+                        let finished = current.indent_stack.pop().unwrap();
+                        let parent_len = current.indent_stack.last().map(|l| l.indent_len).unwrap_or(0);
+                        current.known_indent.truncate(parent_len);
+                        finalize_indent_level(current, finished, pos);
+                    } else if new_len == top.indent_len {
+                        // Same level
+                        if !top.indented.is_empty() {
+                            // Had indented content = start new block
+                            let finished = current.indent_stack.pop().unwrap();
+                            let parent_len = current.indent_stack.last().map(|l| l.indent_len).unwrap_or(0);
+                            current.known_indent.truncate(parent_len);
+                            finalize_indent_level(current, finished, pos);
+                        } else {
+                            // Continue in same block, truncate any extension
+                            current.known_indent.truncate(new_len);
+                            break;
+                        }
+                    } else {
+                        // new_len > top.indent_len - deeper, will push below
+                        break;
                     }
+                }
+
+                // Check if we need to create a new indent level
+                let should_push = if let Some(top) = current.indent_stack.last() {
+                    new_len > top.indent_len
                 } else {
-                    // No indent levels yet, create the first one
-                    current_paren.indent_stack.push(IndentLevel {
-                        whitespace: indent_ws,
+                    true // No levels yet
+                };
+                
+                if should_push {
+                    current.indent_stack.push(IndentLevel {
+                        indent_len: new_len,
                         root_line: Vec::new(),
                         indented: Vec::new(),
-                        in_indented: false,
                         span_start: pos,
                     });
                 }
@@ -594,13 +621,63 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                 pos += 1;
             }
 
-            // Opening brackets
+            // Opening brackets - start an invocation
             '(' | '[' | '{' => {
                 let paren_type = ParenType::from_open(c);
 
-                paren_stack.push(ParenLevel {
+                // Steal the previous token (if any) as the caller
+                let mut caller = {
+                    let current = invocation_stack.last_mut().unwrap();
+                    current.get_output().pop()
+                };
+
+                // If no caller found and we're at a fresh indent level (nothing on this line yet),
+                // try stealing from the parent indent level. This handles:
+                //   foo
+                //     (bar)  -> becomes foo(bar) instead of Indental{foo, [(bar)]}
+                if caller.is_none() {
+                    let current = invocation_stack.last_mut().unwrap();
+                    if let Some(indent) = current.indent_stack.last() {
+                        // Check if current indent level is empty (we just increased indent)
+                        if indent.root_line.is_empty() && indent.indented.is_empty() {
+                            // Pop the empty indent level and steal from parent
+                            if current.indent_stack.len() >= 2 {
+                                current.indent_stack.pop(); // Remove empty level
+                                // Truncate known_indent to parent's length
+                                let new_len = current.indent_stack.last().map(|l| l.indent_len).unwrap_or(0);
+                                current.known_indent.truncate(new_len);
+                                // Now try to steal from parent level's root_line
+                                if let Some(parent) = current.indent_stack.last_mut() {
+                                    caller = parent.root_line.pop();
+                                    // Parent's state is fine - if it becomes empty, !indented.is_empty()
+                                    // will be false anyway
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Only allow None caller at file root level (invocation_stack.len() == 1)
+                // and only if we're not inside any indent structure
+                let at_file_root = invocation_stack.len() == 1;
+                if caller.is_none() && !at_file_root {
+                    return Err(Error::new(
+                        Span::new(pos, 1),
+                        format!("Opening '{}' requires a caller - nothing precedes it", c),
+                    ));
+                }
+
+                // Adjust span_start to include the caller if present
+                let span_start = match &caller {
+                    Some(t) => t.span().start,
+                    None => pos,
+                };
+
+                invocation_stack.push(InvocationLevel {
                     paren_type: Some(paren_type),
-                    span_start: pos,
+                    caller,
+                    span_start,
+                    known_indent: String::new(),
                     indent_stack: Vec::new(),
                     content: Vec::new(),
                 });
@@ -609,19 +686,19 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                 pos += 1;
             }
 
-            // Closing brackets
+            // Closing brackets - complete an invocation
             ')' | ']' | '}' => {
                 let expected_type = ParenType::from_close(c);
 
                 // Check we're not trying to close the root
-                if paren_stack.len() <= 1 {
+                if invocation_stack.len() <= 1 {
                     return Err(Error::new(
                         Span::new(pos, 1),
                         format!("Unmatched closing bracket: '{}'", c),
                     ));
                 }
 
-                let mut entry = paren_stack.pop().unwrap();
+                let mut entry = invocation_stack.pop().unwrap();
 
                 // Check for matching paren type
                 let entry_type = entry.paren_type.unwrap(); // Safe: not root
@@ -636,17 +713,20 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                     ));
                 }
 
-                // Flush any remaining indents inside this paren
+                // Flush any remaining indents inside this invocation
                 entry.flush_indents(pos);
 
-                // Create the Parens tokk
+                // Box the caller if present
+                let caller_boxed = entry.caller.map(Box::new);
+
+                // Create the Invocation tokk
                 let tokk = Tokk {
                     span: Span::from_range(entry.span_start, pos + 1),
-                    content: TokkV::Parens(entry_type, entry.content),
+                    content: TokkV::Invocation(entry_type, caller_boxed, entry.content),
                 };
 
                 // Add to parent's output
-                let parent = paren_stack.last_mut().unwrap();
+                let parent = invocation_stack.last_mut().unwrap();
                 parent.get_output().push(Toast::Tokk(tokk));
 
                 chars.next();
@@ -737,7 +817,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                     span: Span::from_range(start, pos),
                     content: TokkV::Quoted(quote_type, value),
                 };
-                let current = paren_stack.last_mut().unwrap();
+                let current = invocation_stack.last_mut().unwrap();
                 current.get_output().push(Toast::Tokk(tokk));
             }
 
@@ -759,7 +839,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                     span: Span::from_range(start, pos),
                     content: TokkV::Token(op),
                 };
-                let current = paren_stack.last_mut().unwrap();
+                let current = invocation_stack.last_mut().unwrap();
                 current.get_output().push(Toast::Tokk(tokk));
             }
 
@@ -805,7 +885,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                         span: Span::from_range(start, pos),
                         content: TokkV::Token(content),
                     };
-                    let current = paren_stack.last_mut().unwrap();
+                    let current = invocation_stack.last_mut().unwrap();
                     current.get_output().push(Toast::Tokk(tokk));
                 } else {
                     // Single-line comment
@@ -823,7 +903,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                         span: Span::from_range(start, pos),
                         content: TokkV::Token(content),
                     };
-                    let current = paren_stack.last_mut().unwrap();
+                    let current = invocation_stack.last_mut().unwrap();
                     current.get_output().push(Toast::Tokk(tokk));
                 }
             }
@@ -860,7 +940,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                         span: Span::from_range(start, pos),
                         content: TokkV::Token(value),
                     };
-                    let current = paren_stack.last_mut().unwrap();
+                    let current = invocation_stack.last_mut().unwrap();
                     current.get_output().push(Toast::Tokk(tokk));
                 }
             }
@@ -868,8 +948,8 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
     }
 
     // Check for unclosed parens (any beyond the root)
-    if paren_stack.len() > 1 {
-        let entry = &paren_stack[paren_stack.len() - 1];
+    if invocation_stack.len() > 1 {
+        let entry = &invocation_stack[invocation_stack.len() - 1];
         let paren_char = entry.paren_type.unwrap().close_char();
         return Err(Error::new(
             Span::new(entry.span_start, 1),
@@ -878,18 +958,16 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
     }
 
     // Flush remaining indent stack in root and return its content
-    let mut root = paren_stack.pop().unwrap();
+    let mut root = invocation_stack.pop().unwrap();
     root.flush_indents(pos);
     Ok(root.content)
 }
 
-// Token Or Ast
-// this isn't correct, you need modifications of Tokks and Asts that also link only to TokkOrAsts. Honestly you want a dynamically typed graph.
-
+/// Token Or Ast
 #[derive(Debug)]
 enum Toast {
     Tokk(Tokk),
-    Ast(Ast),
+    Ast(ToastAst),
 }
 impl Toast {
     fn as_tokk(&self) -> &Tokk {
@@ -898,7 +976,7 @@ impl Toast {
             Toast::Ast(ast) => panic!("Toast is not a Tokk"),
         }
     }  
-    fn as_ast(&self) -> &Ast {
+    fn as_ast(&self) -> &ToastAst {
         match self {
             Toast::Tokk(tokk) => panic!("Toast is not an Ast"),
             Toast::Ast(ast) => ast,
@@ -912,9 +990,56 @@ impl Toast {
     }
 }
 
+#[derive(Debug)]
+/// ToastAst is like ast::Ast but links Toasts instead of Asts for parser rewriting.
+pub struct ToastAst {
+    pub span: Span,
+    pub v: ToastAstV,
+}
+
+#[derive(Debug)]
+pub enum ToastAstV {
+    Invocation {
+        span: Span,
+        head: String,
+        parentheticals: Vec<Vec<Box<Toast>>>,
+    },
+    Comment {
+        span: Span,
+        content: String,
+    },
+    Conditional {
+        span: Span,
+        condition: Box<Toast>,
+        then: Box<Toast>,
+        elsen: Option<Box<Toast>>,
+        elsifs: Vec<(Box<Toast>, Box<Toast>)>,
+    },
+    Function {
+        span: Span,
+        args: Vec<Box<Toast>>,
+        return_type: Option<Box<Toast>>,
+        body: Box<Toast>,
+    },
+    Block {
+        span: Span,
+        statements: Vec<Box<Toast>>,
+    },
+    Operator {
+        span: Span,
+        name: String,
+        arguments: Vec<Box<Toast>>,
+    },
+    Atom {
+        span: Span,
+        value: String,
+    },
+}
+
+
 /**
-Takes a sequence of [Tokk]s and applies some rewrite rules to transform it into an Ast.
-for each `for`, one of the following rules must match around its key term, and that rule transforms it into an Ast. If no rule matches under a for expression, this is a syntax error. If there are no syntax errors, all remaining Tokks are converted to Tokens and the Ast is complete.
+Takes a sequence of [Toast]s that are initially all [Tokk]s and applies some rewrite rules to transform them into [Ast] Toasts, which are then stripped down into a tree of pure Asts.
+for each `for`, either the result must already be in the to [final state] form, or one of the following rules must match around its key term (which then take it to that final state), and that rule transforms it into an Ast. If no rule matches under a for expression, this is a syntax error. If there are no syntax errors, all remaining Tokks are converted to Tokens and the Ast is complete.
 `%reverse` means it's greedy but from the other direction, processing terms from the right first
 The macro matching rule syntax here is pretty much taken from rust.
 
@@ -923,7 +1048,7 @@ The macro matching rule syntax here is pretty much taken from rust.
 %indental(a@$($_ $_:operators)+ $y*)($z*) → $a %indental($y)($z))
 
 # convert all infix operator expressions to invocation asts
-for $o:Tokk in operators:
+for $o in operators:
     $x $o $y → $o($x $y)
     %indental($x* $o)($(y)*) → $o($x $y)
 
@@ -942,16 +1067,36 @@ def %elif → elif(condition($c) then($x))
 
 for "if"
     %if $(%elif)* $(%else)?
+
+for "do" to do($doings*)
+    %indental(do $predoings*)($doings*) → do($predoings* $doings*)
     
 for "fn"
-    fn($parameters* to $doings*) → fn(parameters($parameters*) body($doings*))
-    %indental(fn $parameters* $(to)?)($doings*) → fn(parameters($parameters*) body($doings*))
-    fn($parameters* to:$return $doings*) → fn(parameters($parameters*) returnType($return)) body($doings*)
-    %indental(fn $parameters* to $(:)? $return)($doings*) → fn(parameters($parameters*) returnType($return)) body($doings*)
-
+    to fn(parameters($parameters*) body($doings*))
+        fn($parameters* to $doings*)
+        %indental(fn $parameters* $(to)?)($doings*)
+    to fn(parameters($parameters*) returnType($return)) body($doings*)
+        fn($parameters* to:$return $doings*)
+        %indental(fn $parameters* to $(:)? $return)($doings*)
+    
+It then converts all remaining indentals into function invocations, and then all remaining token parens into invocations, and all remaining tokens into the corresponding ast.
+Hmm maybe the paren to invocation step should happen in the sequence stage
 */
-fn structure(mut tokks: Vec<Toast>, operators:&[String], operator_table: &OperatorTable, rules: &[KeywordRule]) -> Result<Ast, Error> {
-    todo!("implement parse");
+/*
+// TODO: Incomplete work-in-progress code - commented out to allow tests to compile
+fn structure(mut tokks: Vec<Toast>, operators:&[String], operator_table: &OperatorTable, rules: &[KeywordRule]) -> Result<Arena, Error> {
+    
+    
+    let mut arena = Arena::new();
+    
+    for tokk in tokks {
+        let mut toast = tokk;
+        for rule in rules {
+            if rule.keywords.contains(&toast.as_tokk().content.to_string()) {
+                toast = rule.rule(&mut toast)?;
+            }
+        }
+    }
 }
 
 // struct Alteration<'a> {
@@ -959,28 +1104,43 @@ fn structure(mut tokks: Vec<Toast>, operators:&[String], operator_table: &Operat
 //     replacement: Box<Ast>,
 // }
 
-struct TastGraph {
-    nodes: Vec<TastNode>,
-}
 
-struct TastCursor<'a> {
-    sequence: &'a mut TastGraph,
-    index: usize,
-}
 
 /// matches against any of the keywords
 struct KeywordRule {
     keywords: Vec<String>,
-    rule: fn(TastCursor<'a>) -> Result<(), Error>,
+    rule: fn(t:& mut Toast) -> Result<Toast, Error>,
 }
 
 /// operators are ordered from highest to lowest precedence
-fn parse(content: &str, operators:&[String], rules: &[KeywordRule]) -> Result<Ast, Error> {
+fn parse(content: &str, operators:&[String], rules: &[KeywordRule]) -> Result<Arena, Error> {
     let operator_table = OperatorTable::new(operators.to_vec());
     let tokks = sequence(content, &operator_table)?;
     structure(tokks, operators, &operator_table, &rules)
 }
 
+fn parse_language(content: &str)-> Result<Arena, Error> {
+    parse(content, &[
+        ".".into(),
+        ":".into(),
+        "@".into(),
+        "/".into(),
+        "*".into(),
+        "-".into(),
+        "+".into(),
+        "==".into(),
+        "!=".into(),
+        "<".into(),
+        ">".into(),
+        "<=".into(),
+        ">=".into(),
+        "&&".into(),
+        "||".into(),
+        "=".into(),
+    ],
+    &[])
+}
+*/
 
 // ============================================================================
 // Tests
@@ -995,7 +1155,15 @@ mod tests {
     // ========================================================================
 
     /// Helper to extract token string from Scrip
-    fn as_token(tokk: &Tokk) -> Option<&str> {
+    fn as_token(tokk: &Toast) -> Option<&str> {
+        match &tokk {
+            Toast::Tokk(Tokk { content: TokkV::Token(s), .. }) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Helper to extract token string from Tokk directly
+    fn as_token_from_tokk(tokk: &Tokk) -> Option<&str> {
         match &tokk.content {
             TokkV::Token(s) => Some(s),
             _ => None,
@@ -1003,28 +1171,27 @@ mod tests {
     }
 
     /// Helper to extract quoted string from tokk
-    fn as_quoted(tokk: &Tokk) -> Option<(QuoteType, &str)> {
-        match &tokk.content {
-            TokkV::Quoted(qt, s) => Some((*qt, s)),
+    fn as_quoted(tokk: &Toast) -> Option<(QuoteType, &str)> {
+        match &tokk {
+            Toast::Tokk(Tokk { content: TokkV::Quoted(qt, s), .. }) => Some((*qt, s)),
             _ => None,
         }
     }
 
-    /// Helper to extract parens content from tokk
-    fn as_parens(tokk: &Tokk) -> &Tokk {
-        match &tokk.content {
-            TokkV::Parens(pt, content) => content,
-            _ => panic!("Toast is not a Parens"),
+    /// Helper to extract invocation content from tokk
+    fn as_invocation(tokk: &Toast) -> (ParenType, Option<&Toast>, &Vec<Toast>) {
+        match &tokk {
+            Toast::Tokk(Tokk { content: TokkV::Invocation(pt, caller, content), .. }) => {
+                (*pt, caller.as_ref().map(|b| b.as_ref()), content)
+            }
+            _ => panic!("Toast is not an Invocation"),
         }
     }
 
     /// Helper to extract indental from tokk
-    fn as_indental(tokk: &Tokk) -> Option<(&Vec<Tokk>, &Vec<Tokk>)> {
-        match &tokk.content {
-            TokkV::Indental {
-                root_line,
-                indented,
-            } => Some((root_line, indented)),
+    fn as_indental(tokk: &Toast) -> Option<(&Vec<Toast>, &Vec<Toast>)> {
+        match &tokk {
+            Toast::Tokk(Tokk { content: TokkV::Indental { root_line, indented }, .. }) => Some((root_line, indented)),
             _ => None,
         }
     }
@@ -1064,11 +1231,13 @@ mod tests {
     fn test_tokenize_parens() {
         let ops = make_operator_table();
         let tokks = sequence("foo(bar)", &ops).expect("should tokenize");
-        assert_eq!(tokks.len(), 2);
-        assert_eq!(as_token(&tokks[0]), Some("foo"));
+        // foo(bar) is a single invocation with foo as caller
+        assert_eq!(tokks.len(), 1);
 
-        let (paren_type, content) = as_parens(&tokks[1]).expect("should be parens");
+        let (paren_type, caller, content) = as_invocation(&tokks[0]);
         assert!(matches!(paren_type, ParenType::Round));
+        assert!(caller.is_some());
+        assert_eq!(as_token(caller.unwrap()), Some("foo"));
         assert_eq!(content.len(), 1);
         assert_eq!(as_token(&content[0]), Some("bar"));
     }
@@ -1077,11 +1246,13 @@ mod tests {
     fn test_tokenize_square_brackets() {
         let ops = make_operator_table();
         let tokks = sequence("arr[0]", &ops).expect("should tokenize");
-        assert_eq!(tokks.len(), 2);
-        assert_eq!(as_token(&tokks[0]), Some("arr"));
+        // arr[0] is a single invocation with arr as caller
+        assert_eq!(tokks.len(), 1);
 
-        let (paren_type, content) = as_parens(tokks[1].as_tokk()).expect("should be parens");
+        let (paren_type, caller, content) = as_invocation(&tokks[0]);
         assert!(matches!(paren_type, ParenType::Square));
+        assert!(caller.is_some());
+        assert_eq!(as_token(caller.unwrap()), Some("arr"));
         assert_eq!(content.len(), 1);
         assert_eq!(as_token(&content[0]), Some("0"));
     }
@@ -1090,10 +1261,12 @@ mod tests {
     fn test_tokenize_curly_brackets() {
         let ops = make_operator_table();
         let tokks = sequence("{a b}", &ops).expect("should tokenize");
+        // {a b} has no caller
         assert_eq!(tokks.len(), 1);
 
-        let (paren_type, content) = as_parens(tokks[0].as_tokk()).expect("should be parens");
+        let (paren_type, caller, content) = as_invocation(&tokks[0]);
         assert!(matches!(paren_type, ParenType::Curly));
+        assert!(caller.is_none());
         assert_eq!(content.len(), 2);
         assert_eq!(as_token(&content[0]), Some("a"));
         assert_eq!(as_token(&content[1]), Some("b"));
@@ -1208,14 +1381,18 @@ mod tests {
     fn test_tokenize_nested_parens() {
         let ops = make_operator_table();
         let scrips = sequence("f(g(x))", &ops).expect("should tokenize");
-        assert_eq!(scrips.len(), 2);
-        assert_eq!(as_token(&scrips[0]), Some("f"));
+        // f(g(x)) is one invocation: caller=f, content=[g(x)]
+        assert_eq!(scrips.len(), 1);
 
-        let (_, outer_content) = as_parens(&scrips[1]).expect("should be parens");
-        assert_eq!(outer_content.len(), 2);
-        assert_eq!(as_token(&outer_content[0]), Some("g"));
+        let (_, outer_caller, outer_content) = as_invocation(&scrips[0]);
+        assert!(outer_caller.is_some());
+        assert_eq!(as_token(outer_caller.unwrap()), Some("f"));
+        // Inside f(...) we have g(x) which is one invocation
+        assert_eq!(outer_content.len(), 1);
 
-        let (_, inner_content) = as_parens(&outer_content[1]).expect("should be parens");
+        let (_, inner_caller, inner_content) = as_invocation(&outer_content[0]);
+        assert!(inner_caller.is_some());
+        assert_eq!(as_token(inner_caller.unwrap()), Some("g"));
         assert_eq!(inner_content.len(), 1);
         assert_eq!(as_token(&inner_content[0]), Some("x"));
     }
@@ -1240,13 +1417,15 @@ mod tests {
     #[test]
     fn test_tokenize_same_indent_inside_parens() {
         let ops = make_operator_table();
-        // Items at the same indent level inside parens are flat
+        // Items at the same indent level inside invocation are flat
         let scrips = sequence("f(\n  a\n  b\n)", &ops).expect("should tokenize");
 
-        assert_eq!(scrips.len(), 2);
-        assert_eq!(as_token(&scrips[0]), Some("f"));
+        // f(...) is one invocation with caller=f
+        assert_eq!(scrips.len(), 1);
 
-        let (_, content) = as_parens(&scrips[1]).expect("should be parens");
+        let (_, caller, content) = as_invocation(&scrips[0]);
+        assert!(caller.is_some());
+        assert_eq!(as_token(caller.unwrap()), Some("f"));
         // a and b at same indent level should be flat
         assert_eq!(content.len(), 2);
         assert_eq!(as_token(&content[0]), Some("a"));
@@ -1256,14 +1435,16 @@ mod tests {
     #[test]
     fn test_tokenize_indent_works_inside_parens() {
         let ops = make_operator_table();
-        // Indentation creates structure inside parens too
+        // Indentation creates structure inside invocations too
         let scrips = sequence("f(\n  a\n    b\n)", &ops).expect("should tokenize");
 
-        assert_eq!(scrips.len(), 2);
-        assert_eq!(as_token(&scrips[0]), Some("f"));
+        // f(...) is one invocation with caller=f
+        assert_eq!(scrips.len(), 1);
 
-        let (_, content) = as_parens(&scrips[1]).expect("should be parens");
-        // a with indented b should form an Indental inside the parens
+        let (_, caller, content) = as_invocation(&scrips[0]);
+        assert!(caller.is_some());
+        assert_eq!(as_token(caller.unwrap()), Some("f"));
+        // a with indented b should form an Indental inside the invocation
         assert_eq!(content.len(), 1);
         let (root_line, indented) = as_indental(&content[0]).expect("should be indental");
         assert_eq!(as_token(&root_line[0]), Some("a"));
@@ -1395,7 +1576,7 @@ mod tests {
     #[test]
     fn test_tokenize_indent_after_paren_closes() {
         let ops = make_operator_table();
-        // Indent structure resumes after paren closes
+        // Indent structure resumes after invocation closes
         let scrips = sequence("a\n  f(x)\n  b", &ops).expect("should tokenize");
 
         assert_eq!(scrips.len(), 1);
@@ -1403,12 +1584,13 @@ mod tests {
 
         assert_eq!(as_token(&root_line[0]), Some("a"));
         
-        // indented has: f, (x), b
-        assert_eq!(indented.len(), 3);
-        assert_eq!(as_token(&indented[0]), Some("f"));
-        let (_, paren_content) = as_parens(&indented[1]).expect("should be parens");
-        assert_eq!(as_token(&paren_content[0]), Some("x"));
-        assert_eq!(as_token(&indented[2]), Some("b"));
+        // indented has: f(x) as one invocation, then b
+        assert_eq!(indented.len(), 2);
+        let (_, caller, content) = as_invocation(&indented[0]);
+        assert!(caller.is_some());
+        assert_eq!(as_token(caller.unwrap()), Some("f"));
+        assert_eq!(as_token(&content[0]), Some("x"));
+        assert_eq!(as_token(&indented[1]), Some("b"));
     }
 
     #[test]
@@ -1443,26 +1625,27 @@ mod tests {
     #[test]
     fn test_tokenize_indent_discontinuity_in_parens() {
         let ops = make_operator_table();
-        // Outside uses 2 spaces, inside paren uses tabs - allowed because paren resets indent
+        // Outside uses 2 spaces, inside invocation uses tabs - allowed because invocation resets indent
         let scrips = sequence("a\n  b(\n\tx\n\t\ty\n  )\n  c", &ops).expect("should tokenize");
 
-        // Structure: a -> [b, (...), c] where inside paren is x -> [y]
+        // Structure: a -> [b(...), c] where b(...) has caller=b and inside is x -> [y]
         assert_eq!(scrips.len(), 1);
         let (root, indented) = as_indental(&scrips[0]).expect("outer indental");
         assert_eq!(as_token(&root[0]), Some("a"));
 
-        // indented has: b, parens, c
-        assert_eq!(indented.len(), 3);
-        assert_eq!(as_token(&indented[0]), Some("b"));
+        // indented has: b(...) as one invocation, then c
+        assert_eq!(indented.len(), 2);
         
-        let (_, paren_content) = as_parens(&indented[1]).expect("should be parens");
-        // Inside paren: x -> [y] using tab indentation
+        let (_, caller, paren_content) = as_invocation(&indented[0]);
+        assert!(caller.is_some());
+        assert_eq!(as_token(caller.unwrap()), Some("b"));
+        // Inside invocation: x -> [y] using tab indentation
         assert_eq!(paren_content.len(), 1);
         let (inner_root, inner_indented) = as_indental(&paren_content[0]).expect("inner indental");
         assert_eq!(as_token(&inner_root[0]), Some("x"));
         assert_eq!(as_token(&inner_indented[0]), Some("y"));
 
-        assert_eq!(as_token(&indented[2]), Some("c"));
+        assert_eq!(as_token(&indented[1]), Some("c"));
     }
 
     #[test]
@@ -1506,5 +1689,97 @@ mod tests {
         let (r2, i2) = as_indental(&i1[0]).expect("level 2");
         assert_eq!(as_token(&r2[0]), Some("b"));
         assert_eq!(as_token(&i2[0]), Some("c"));
+    }
+
+    #[test]
+    fn test_tokenize_multi_level_dedent() {
+        let ops = make_operator_table();
+        // a at root, b indented, c more indented, d back at root
+        // Should produce: Indental{a, [Indental{b, [c]}]}, d
+        let scrips = sequence("a\n  b\n    c\nd", &ops).expect("should tokenize");
+
+        assert_eq!(scrips.len(), 2);
+        
+        // First is the indental structure
+        let (r1, i1) = as_indental(&scrips[0]).expect("outer indental");
+        assert_eq!(as_token(&r1[0]), Some("a"));
+        
+        // Inside a's indented: b with c indented under it
+        assert_eq!(i1.len(), 1);
+        let (r2, i2) = as_indental(&i1[0]).expect("inner indental");
+        assert_eq!(as_token(&r2[0]), Some("b"));
+        assert_eq!(as_token(&i2[0]), Some("c"));
+        
+        // Second is d at root level
+        assert_eq!(as_token(&scrips[1]), Some("d"));
+    }
+
+    #[test]
+    fn test_tokenize_paren_without_caller_error_inside_paren() {
+        let ops = make_operator_table();
+        // Inside a paren, another paren without a caller is an error
+        let result = sequence("f(\n  (x)\n)", &ops);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("requires a caller"));
+    }
+
+    #[test]
+    fn test_tokenize_paren_after_indent_steals_caller() {
+        let ops = make_operator_table();
+        // Paren immediately after indent increase steals caller from parent
+        // foo\n  (bar) becomes foo(bar), not Indental{foo, [(bar)]}
+        let scrips = sequence("foo\n  (bar)", &ops).expect("should tokenize");
+
+        // Should be one invocation with caller=foo
+        assert_eq!(scrips.len(), 1);
+        let (_, caller, content) = as_invocation(&scrips[0]);
+        assert!(caller.is_some());
+        assert_eq!(as_token(caller.unwrap()), Some("foo"));
+        assert_eq!(content.len(), 1);
+        assert_eq!(as_token(&content[0]), Some("bar"));
+    }
+
+    #[test]
+    fn test_tokenize_paren_after_indent_with_multiple_args() {
+        let ops = make_operator_table();
+        // foo\n  (a b c) becomes foo(a b c)
+        let scrips = sequence("foo\n  (a b c)", &ops).expect("should tokenize");
+
+        assert_eq!(scrips.len(), 1);
+        let (_, caller, content) = as_invocation(&scrips[0]);
+        assert!(caller.is_some());
+        assert_eq!(as_token(caller.unwrap()), Some("foo"));
+        assert_eq!(content.len(), 3);
+        assert_eq!(as_token(&content[0]), Some("a"));
+        assert_eq!(as_token(&content[1]), Some("b"));
+        assert_eq!(as_token(&content[2]), Some("c"));
+    }
+
+    #[test]
+    fn test_tokenize_curly_at_root_no_caller_ok() {
+        let ops = make_operator_table();
+        // At file root level, a paren/curly with no caller is allowed
+        let scrips = sequence("{a b}", &ops).expect("should tokenize");
+
+        assert_eq!(scrips.len(), 1);
+        let (paren_type, caller, content) = as_invocation(&scrips[0]);
+        assert!(matches!(paren_type, ParenType::Curly));
+        assert!(caller.is_none()); // No caller at root is OK
+        assert_eq!(content.len(), 2);
+    }
+
+    #[test]
+    fn test_tokenize_nested_paren_needs_caller() {
+        let ops = make_operator_table();
+        // g(x) inside f() is OK because g is the caller
+        let scrips = sequence("f(g(x))", &ops).expect("should tokenize");
+        assert_eq!(scrips.len(), 1);
+        
+        // But ((x)) should fail because inner ( has no caller
+        let result = sequence("f((x))", &ops);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.message.contains("requires a caller"));
     }
 }
