@@ -5,6 +5,8 @@
 // keywords: fn, to, if, else, elif
 
 
+use std::mem::take;
+
 use crate::{Ref, Arena};
 /*
 The example input:
@@ -13,13 +15,20 @@ The example input:
   # this tantrum evolved into "how can we keep the parser minimalistic and flexible" and the answer turned out to be "it should mostly be term rewriting over a tokenizer, though the tokenization may not just be tokens, it may retain indent structure and stuff"
 
 f = fn(a:int b:int to:int a + b)
+f = fn a:int b:int to:int
+    a + b
+
+
 print(f(1 2))
+
 # this is a comment
 #(
   this is a multiline comment
 )
+
+# I want this to translate to Code objects that're more like let combined = Name("combined") & StructType(a:int b:int). Like, a nominal type should contain its name. We could do that by having struct() take an implicit CodeContext that contains like, the ID of the Code object it's part of and the code object where it's defined.
 combined = struct(a:int b:int)
-# various musing on function syntax
+
 fc = fn(c:combined to:int c.a + c.b)
 
 fc = fn c:combined to int
@@ -32,9 +41,6 @@ ac =
 
 */
 
-// ============================================================================
-// AST Types
-// ============================================================================
 
 #[derive(Debug, Clone, Copy)]
 pub struct Span {
@@ -73,6 +79,8 @@ pub enum QuoteType {
 pub enum TokkV {
     Token(String),
     Quoted(QuoteType, String),
+    // we're not using lines (we only need indental), but if anyone wants lines that'd make sense and they can have one
+    // Line(Vec<Toast>)
     /// Invocation: paren type, optional caller (the token before the paren), and arguments
     Invocation(ParenType, Option<Box<Toast>>, Vec<Toast>),
     Indental {
@@ -215,67 +223,6 @@ impl ParenType {
     }
 }
 
-mod ast {
-    use crate::parser::Span;
-
-#[derive(Debug)]
-/// AL is [Ast] node Link type. Before the parser it'll be [Toast]s, after the parser it'll be Box<Ast>s. During type checking you'll probably want it to be graph node ids.
-pub struct Ast {
-    pub span: Span,
-    pub v: AstV,
-}
-
-#[derive(Debug)]
-enum AstV {
-    Invocation(Invocation),
-    Comment(Comment),
-    Conditional(Conditional),
-    Function {
-        args: Vec<Box<Ast>>,
-        return_type: Option<Box<Ast>>,
-        body: Box<Ast>,
-    },
-    Block {
-        statements: Vec<Box<Ast>>,
-    },
-}
-
-#[derive(Debug)]
-struct Conditional {
-    condition: Box<Ast>,
-    then: Box<Ast>,
-    elsen: Option<Box<Ast>>,
-    elsifs: Vec<(Box<Ast>, Box<Ast>)>,
-}
-
-#[derive(Debug)]
-pub struct Invocation {
-    pub span: Span,
-    pub head: String,
-    pub parentheticals: Vec<Vec<Ast>>,
-}
-
-#[derive(Debug)]
-pub struct Operator {
-    pub span: Span,
-    pub name: String,
-    pub arguments: Vec<Ast>,
-}
-
-#[derive(Debug)]
-pub struct Comment {
-    pub span: Span,
-    pub content: String,
-}
-
-#[derive(Debug)]
-pub struct Atom {
-    pub span: Span,
-    pub value: String,
-}
-}
-
-pub use ast::Ast;
 
 #[derive(Debug)]
 pub struct Error {
@@ -975,11 +922,60 @@ impl Toast {
             Toast::Tokk(tokk) => tokk,
             Toast::Ast(ast) => panic!("Toast is not a Tokk"),
         }
-    }  
-    fn as_ast(&self) -> &ToastAst {
+    } 
+    /// makes sure every toast is an ast
+    fn verify_ast(&self)-> Result<&Toast, Vec<Error>> {
+        let mut errors = Vec::new();
+        self.verify_ast_writer(&mut errors);
+        if errors.is_empty() {
+            Ok(self)
+        } else {
+            Err(errors)
+        }
+    }
+    fn verify_ast_writer(&self, errors: &mut Vec<Error>) {
         match self {
-            Toast::Tokk(tokk) => panic!("Toast is not an Ast"),
-            Toast::Ast(ast) => ast,
+            Toast::Tokk(tokk) => errors.push(Error::new(tokk.span, "Toast is not an Ast")),
+            Toast::Ast(ast) => {
+                match &ast.v {
+                    ToastAstV::Invocation { parameters, .. } => {
+                        for p in parameters {
+                            p.verify_ast_writer(errors);
+                        }
+                    }
+                    ToastAstV::Conditional { condition, then, elsen, elsifs, .. } => {
+                            condition.verify_ast_writer(errors);
+                        then.verify_ast_writer(errors);
+                        if let Some(e) = elsen {
+                            e.verify_ast_writer(errors);
+                        }
+                        for (c, b) in elsifs {
+                            c.verify_ast_writer(errors);
+                            b.verify_ast_writer(errors);
+                        }
+                    }
+                    ToastAstV::Function { args, return_type, body, .. } => {
+                        for arg in args {
+                            arg.verify_ast_writer(errors);
+                        }
+                        if let Some(r) = return_type {
+                            r.verify_ast_writer(errors);
+                        }
+                        body.verify_ast_writer(errors);
+                    }
+                    ToastAstV::Block { statements, .. } => {
+                        for st in statements {
+                            st.verify_ast_writer(errors);
+                        }
+                    }
+                    ToastAstV::Operator { arguments, .. } => {
+                        for a in arguments {
+                            a.verify_ast_writer(errors);
+                        }
+                    }
+                    _ => {},
+                }
+            }
         }
     }
     fn span(&self) -> Span {
@@ -991,7 +987,6 @@ impl Toast {
 }
 
 #[derive(Debug)]
-/// ToastAst is like ast::Ast but links Toasts instead of Asts for parser rewriting.
 pub struct ToastAst {
     pub span: Span,
     pub v: ToastAstV,
@@ -1002,7 +997,8 @@ pub enum ToastAstV {
     Invocation {
         span: Span,
         head: String,
-        parentheticals: Vec<Vec<Box<Toast>>>,
+        kind: ParenType,
+        parameters: Vec<Box<Toast>>,
     },
     Comment {
         span: Span,
@@ -1025,75 +1021,215 @@ pub enum ToastAstV {
         span: Span,
         statements: Vec<Box<Toast>>,
     },
-    Operator {
-        span: Span,
-        name: String,
-        arguments: Vec<Box<Toast>>,
-    },
     Atom {
         span: Span,
         value: String,
     },
+    Quoted {
+        span: Span,
+        quote_type: QuoteType,
+        value: String,
+    }
 }
 
 
 /**
-Takes a sequence of [Toast]s that are initially all [Tokk]s and applies some rewrite rules to transform them into [Ast] Toasts, which are then stripped down into a tree of pure Asts.
+the astrule step takes a sequence of [Toast]s that are initially all [Tokk]s and applies some rewrite rules to transform them into [Ast] Toasts, which are then stripped down into a tree of pure Asts.
 for each `for`, either the result must already be in the to [final state] form, or one of the following rules must match around its key term (which then take it to that final state), and that rule transforms it into an Ast. If no rule matches under a for expression, this is a syntax error. If there are no syntax errors, all remaining Tokks are converted to Tokens and the Ast is complete.
 `%reverse` means it's greedy but from the other direction, processing terms from the right first
 The macro matching rule syntax here is pretty much taken from rust.
 
-# first, if there are operator-llinked things within an indental head with a non-operator term at the end, the indental belongs to that non-operator stuff at the end
+# backtick quotes just translate to an atom, ie, we use them to allow expressing symbols with spaces in them.
+for $x:Quoted(Backticked) → ast::Atom($x)
+# tokens are just atoms
+for $x:Token → ToastAst::Atom($x)
+
+#if there are operator-llinked things within an indental head with a non-operator term at the end, the indental belongs to that non-operator stuff at the end
 %indental($o:operators $(x)?)($(y)*) → $o($x $y)
-%indental(a@$($_ $_:operators)+ $y*)($z*) → $a %indental($y)($z))
+%indental(a@$($_ $_:operators)+ $y*)($z*) → $a %indental($y)($z)
 
 # convert all infix operator expressions to invocation asts
-for $o in operators:
-    $x $o $y → $o($x $y)
-    %indental($x* $o)($(y)*) → $o($x $y)
+for $o in operators
+    to ast::Invocation(head($o) arguments($x $y))
+        $x $o $y
+        %indental($x* $o)($(y)*)
 
-# we define if elif then as three match functions that can match and convert the parts, whatever form they take
-def %if → if(condition($c) then($x))
+# normalize conditional parts
+to if($c $x)
     if $c $x
     %indental(if $c)($x*)
-    if($c $x*)
-def %else → else($x)
-    else $x
-    %indental(else)($x*)
-def %elif → elif(condition($c) then($x))
+to elif($c $x)
     elif $c $x
     %indental(elif $c)($x*)
-    elif($c $x*)
+to else($x)
+    else $x
+    %indental(else)($x*)
 
-for "if"
-    %if $(%elif)* $(%else)?
+if($c $x*) $(elif($ce $xe))* $(else ($xe))? → ast::Conditional(condition:$c then:$x elsen:$(else ($xe))? elsifs:[$(elif($ce $xe))*])
 
-for "do" to do($doings*)
-    %indental(do $predoings*)($doings*) → do($predoings* $doings*)
-    
-for "fn"
-    to fn(parameters($parameters*) body($doings*))
-        fn($parameters* to $doings*)
-        %indental(fn $parameters* $(to)?)($doings*)
-    to fn(parameters($parameters*) returnType($return)) body($doings*)
-        fn($parameters* to:$return $doings*)
-        %indental(fn $parameters* to $(:)? $return)($doings*)
-    
-It then converts all remaining indentals into function invocations, and then all remaining token parens into invocations, and all remaining tokens into the corresponding ast.
-Hmm maybe the paren to invocation step should happen in the sequence stage
+%indental(do $predoings*)($doings*) → do($predoings* $doings*)
+do($doings*) → Ast::Block(statements:[$doings*])
+
+to ast::Function(parameters:[$parameters] body:[$doings])
+    fn($parameters* to $doings*)
+    %indental(fn $parameters* $(to)?)($doings*)
+    fn $parameters* to $doings
+to ast::Function(parameters:[$parameters*] returnType:$return body:[$doings*])
+    fn($parameters* :(to $return) $doings*)
+    %indental(fn $parameters* to $(:)? $return)($doings*)
+    fn $parameters* :(to $return) $doings
+
+# all remaining indentals are invocations
+%indental($x*)($y*) → ast::Invocation(head:$x arguments:[$y*])
+
+
+After this, in Result, all [Toast]s should be [ToastAst]s, no [Tokk]s should remain.
 */
-/*
-// TODO: Incomplete work-in-progress code - commented out to allow tests to compile
-fn structure(mut tokks: Vec<Toast>, operators:&[String], operator_table: &OperatorTable, rules: &[KeywordRule]) -> Result<Arena, Error> {
-    
-    
-    let mut arena = Arena::new();
-    
-    for tokk in tokks {
-        let mut toast = tokk;
-        for rule in rules {
-            if rule.keywords.contains(&toast.as_tokk().content.to_string()) {
-                toast = rule.rule(&mut toast)?;
+
+fn astrules(mut tokks: Vec<Toast>, operators:&[String], operator_table: &OperatorTable) -> Result<(), Vec<Error>> {
+    let mut errors = Vec::new();
+    astrules_sequence(&mut tokks, operators, operator_table, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+// status: I'm a bit burned out. It turns out that it's not going to be efficient to apply rules one after the other, so the conversion algorithm is going to be a lot less elegant than the spec, and proving that the algorithm agrees with the spec is cognitively draining.
+
+fn astrules_sequence(toasts: &mut Vec<Toast>, operators: &[String], operator_table: &OperatorTable, errors: &mut Vec<Error>) {
+    for toast in toasts {
+        astrules_individual(toast, operators, operator_table, errors);
+    }
+    // look for operators and if else sequences
+    for toast in toasts {
+        match toast {
+            Toast::Ast(ast) => {
+                match 
+            }
+        }
+    }
+}
+fn astrules_individual(toast: &mut Toast, operators: &[String], operator_table: &OperatorTable, errors: &mut Vec<Error>) {
+    match toast {
+        Toast::Tokk(tokk) => {
+            // Convert Tokk to ToastAst based on the rules
+            let span = tokk.span;
+            let new_ast = match &mut tokk.content {
+                // Tokens become atoms: for $x:Token → ast::Atom($x)
+                TokkV::Token(s) => ToastAst {
+                    span,
+                    v: ToastAstV::Atom { span, value: take(s) },
+                },
+                // Backtick quotes become atoms: for $x:Quoted(Backticked) → ast::Atom($x)
+                TokkV::Quoted(QuoteType::Backtick, s) => ToastAst {
+                    span,
+                    v: ToastAstV::Atom { span, value: take(s) },
+                },
+                // Other quotes stay as quoted
+                TokkV::Quoted(quote_type, s) => ToastAst {
+                    span,
+                    v: ToastAstV::Quoted { span, quote_type: *quote_type, value: take(s) },
+                },
+                // Invocations: convert to ast::Invocation and recurse into arguments
+                TokkV::Invocation(paren_type, caller, args) => {
+                    let head = caller.as_ref().map(|c| {
+                        match c.as_ref() {
+                            Toast::Tokk(Tokk { content: TokkV::Token(s), .. }) => s.clone(),
+                            _ => String::new(),
+                        }
+                    }).unwrap_or_default();
+                    let kind = *paren_type;
+                    let mut parameters: Vec<Box<Toast>> = take(args)
+                        .into_iter()
+                        .map(Box::new)
+                        .collect();
+                    // Recurse into each parameter
+                    for param in &mut parameters {
+                        astrules_individual(param, operators, operator_table, errors);
+                    }
+                    ToastAst {
+                        span,
+                        v: ToastAstV::Invocation { span, head, kind, parameters },
+                    }
+                },
+                // Indentals: these need special handling based on the rules
+                TokkV::Indental { root_line, indented } => {
+                    // For now, convert to an invocation with root_line as head context
+                    // and indented as body - this matches %indental patterns
+                    let mut root_params: Vec<Box<Toast>> = take(root_line)
+                        .into_iter()
+                        .map(Box::new)
+                        .collect();
+                    let mut indented_params: Vec<Box<Toast>> = take(indented)
+                        .into_iter()
+                        .map(Box::new)
+                        .collect();
+                    
+                    // Recurse into root_line and indented toasts
+                    for param in &mut root_params {
+                        astrules_individual(param, operators, operator_table, errors);
+                    }
+                    for param in &mut indented_params {
+                        astrules_individual(param, operators, operator_table, errors);
+                    }
+                    
+                    // Combine all parameters - indental becomes an invocation
+                    let mut all_params = root_params;
+                    all_params.extend(indented_params);
+                    
+                    // Try to extract head from first token if available
+                    let head = all_params.first().and_then(|p| {
+                        match p.as_ref() {
+                            Toast::Ast(ToastAst { v: ToastAstV::Atom { value, .. }, .. }) => Some(value.clone()),
+                            _ => None,
+                        }
+                    }).unwrap_or_default();
+                    
+                    ToastAst {
+                        span,
+                        v: ToastAstV::Invocation { span, head, kind: ParenType::Round, parameters: all_params },
+                    }
+                },
+            };
+            *toast = Toast::Ast(new_ast);
+        }
+        Toast::Ast(ast) => {
+            // no conversion, just recurses
+            match &mut ast.v {
+                ToastAstV::Invocation { parameters, .. } => {
+                    for param in parameters {
+                        astrules_individual(param, operators, operator_table, errors);
+                    }
+                }
+                ToastAstV::Conditional { condition, then, elsen, elsifs, .. } => {
+                    astrules_individual(condition, operators, operator_table, errors);
+                    astrules_individual(then, operators, operator_table, errors);
+                    if let Some(e) = elsen {
+                        astrules_individual(e, operators, operator_table, errors);
+                    }
+                    for (cond, body) in elsifs {
+                        astrules_individual(cond, operators, operator_table, errors);
+                        astrules_individual(body, operators, operator_table, errors);
+                    }
+                }
+                ToastAstV::Function { args, return_type, body, .. } => {
+                    for arg in args {
+                        astrules_individual(arg, operators, operator_table, errors);
+                    }
+                    if let Some(ret) = return_type {
+                        astrules_individual(ret, operators, operator_table, errors);
+                    }
+                    astrules_individual(body, operators, operator_table, errors);
+                }
+                ToastAstV::Block { statements, .. } => {
+                    for stmt in statements {
+                        astrules_individual(stmt, operators, operator_table, errors);
+                    }
+                }
+                // Leaf nodes - no children to recurse into
+                ToastAstV::Comment { .. } | ToastAstV::Atom { .. } | ToastAstV::Quoted { .. } => {}
             }
         }
     }
@@ -1113,34 +1249,34 @@ struct KeywordRule {
 }
 
 /// operators are ordered from highest to lowest precedence
-fn parse(content: &str, operators:&[String], rules: &[KeywordRule]) -> Result<Arena, Error> {
-    let operator_table = OperatorTable::new(operators.to_vec());
-    let tokks = sequence(content, &operator_table)?;
-    structure(tokks, operators, &operator_table, &rules)
-}
+// fn parse(content: &str, operators:&[String], rules: &[KeywordRule]) -> Result<Arena, Error> {
+//     let operator_table = OperatorTable::new(operators.to_vec());
+//     let tokks = sequence(content, &operator_table)?;
+//     astrules(tokks, operators, &operator_table, &rules)
+// }
 
-fn parse_language(content: &str)-> Result<Arena, Error> {
-    parse(content, &[
-        ".".into(),
-        ":".into(),
-        "@".into(),
-        "/".into(),
-        "*".into(),
-        "-".into(),
-        "+".into(),
-        "==".into(),
-        "!=".into(),
-        "<".into(),
-        ">".into(),
-        "<=".into(),
-        ">=".into(),
-        "&&".into(),
-        "||".into(),
-        "=".into(),
-    ],
-    &[])
-}
-*/
+// fn parse_language(content: &str)-> Result<Arena, Error> {
+//     parse(content, &[
+//         ".".into(),
+//         ":".into(),
+//         "@".into(),
+//         "/".into(),
+//         "*".into(),
+//         "-".into(),
+//         "+".into(),
+//         "==".into(),
+//         "!=".into(),
+//         "<".into(),
+//         ">".into(),
+//         "<=".into(),
+//         ">=".into(),
+//         "&&".into(),
+//         "||".into(),
+//         "=".into(),
+//     ],
+//     &[])
+// }
+
 
 // ============================================================================
 // Tests
