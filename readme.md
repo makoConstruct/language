@@ -8,6 +8,8 @@ So, here is The Perfect Syntax (spec). It has infix operators, negotiable whites
 
 I'm not sure when I'll implement it. But it wouldn't take long given that we already have the rules and it could be done just as a series of rule applications (but shouldn't, it would be totally crap at providing explanations for syntax errors).
 
+Note, it's intended to be used with an editor that can insert or resolve the missing information, for instance, we don't distinguish reassignments from initializations syntactically, because the editor can just read the code and show you which is which with a note. We also don't require explicit conversions (`.into()` and so on) because the editor can alert you whenever one's happening.
+
 The syntax is like this:
 
 ```
