@@ -4,7 +4,7 @@
 
 use std::{any::Any, collections::HashMap};
 mod parser;
-use crate::parser::{Ast, Error, Span};
+use crate::parser::{Error, Span};
 
 use std::fmt;
 use std::hash::{Hash, Hasher};
@@ -117,7 +117,7 @@ impl Compiler {
             arena: Arena::new(),
         }
     }
-    fn compile(self, _source: Ast) -> (Code, Arena) {
+    fn compile(self) -> (Code, Arena) {
         todo!("implement compilation")
     }
 }

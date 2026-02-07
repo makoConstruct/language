@@ -78,6 +78,7 @@ pub enum QuoteType {
 #[derive(Debug)]
 pub enum TokkV {
     Token(String),
+    Operator(String),
     Quoted(QuoteType, String),
     // we're not using lines (we only need indental), but if anyone wants lines that'd make sense and they can have one
     // Line(Vec<Toast>)
@@ -255,6 +256,35 @@ const OPERATOR_CHARS: &[char] = &[
     '=', ':', '+', '-', '*', '/', '%', '<', '>', '!', '.', '&', '|', '^', ';', '~', '@', '$', '?',
 ];
 
+/// Binding power for an operator - determines precedence and associativity.
+/// For left-associative ops: l_bp < r_bp (e.g., + is (11, 12))
+/// For right-associative ops: l_bp > r_bp (e.g., = is (2, 1))
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BindingPower {
+    pub left: u8,
+    pub right: u8,
+}
+
+impl BindingPower {
+    /// Create a left-associative binding power at the given precedence level.
+    /// Uses (level * 2 + 1, level * 2 + 2) to leave room for right-associative ops.
+    pub fn left_assoc(precedence: u8) -> Self {
+        Self {
+            left: precedence * 2 + 1,
+            right: precedence * 2 + 2,
+        }
+    }
+
+    /// Create a right-associative binding power at the given precedence level.
+    /// Uses (level * 2 + 2, level * 2 + 1) - reversed from left-associative.
+    pub fn right_assoc(precedence: u8) -> Self {
+        Self {
+            left: precedence * 2 + 2,
+            right: precedence * 2 + 1,
+        }
+    }
+}
+
 /// Entry in the operator lookup table, indexed by first character of operator.
 #[derive(Debug, Clone)]
 pub enum OperatorEntry {
@@ -263,11 +293,11 @@ pub enum OperatorEntry {
     /// This character could be an operator but isn't used in the current operator list
     OperatorNotUsed,
     /// Exactly one operator starts with this character.
-    /// Stores (full operator string, precedence) for verification.
-    Single(String, u16),
+    /// Stores (full operator string, binding power).
+    Single(String, BindingPower),
     /// Multiple operators start with this character, need disambiguation.
-    /// Stores vec of (full operator string, precedence).
-    Contended(Vec<(String, u16)>),
+    /// Stores vec of (full operator string, binding power).
+    Contended(Vec<(String, BindingPower)>),
 }
 
 /// Fast operator precedence lookup table.
@@ -278,9 +308,8 @@ pub struct OperatorTable {
 }
 
 impl OperatorTable {
-    /// Build an operator table from a list of operators.
-    /// Operators are given in precedence order: index 0 = lowest precedence.
-    pub fn new(operators: Vec<String>) -> Self {
+    /// Build an operator table from a list of (operator, binding_power) pairs.
+    pub fn new(operators: Vec<(String, BindingPower)>) -> Self {
         use std::collections::HashMap;
 
         // Initialize all entries as Alphanumeric
@@ -295,14 +324,14 @@ impl OperatorTable {
         }
 
         // Group operators by their first character
-        let mut by_first_char: HashMap<char, Vec<(String, u16)>> = HashMap::new();
+        let mut by_first_char: HashMap<char, Vec<(String, BindingPower)>> = HashMap::new();
 
-        for (prec, op) in operators.into_iter().enumerate() {
+        for (op, bp) in operators {
             if let Some(first_char) = op.chars().next() {
                 by_first_char
                     .entry(first_char)
                     .or_default()
-                    .push((op, prec as u16));
+                    .push((op, bp));
             }
         }
 
@@ -311,8 +340,8 @@ impl OperatorTable {
             let idx = c as usize;
             if idx < 128 {
                 entries[idx] = if ops.len() == 1 {
-                    let (op, prec) = ops.into_iter().next().unwrap();
-                    OperatorEntry::Single(op, prec)
+                    let (op, bp) = ops.into_iter().next().unwrap();
+                    OperatorEntry::Single(op, bp)
                 } else {
                     OperatorEntry::Contended(ops)
                 };
@@ -322,9 +351,20 @@ impl OperatorTable {
         Self { entries }
     }
 
-    /// Look up an operator's precedence.
+    /// Build an operator table from a list of operators in precedence order.
+    /// All operators are left-associative. Index 0 = lowest precedence.
+    pub fn from_precedence_list(operators: Vec<String>) -> Self {
+        let ops_with_bp: Vec<(String, BindingPower)> = operators
+            .into_iter()
+            .enumerate()
+            .map(|(prec, op)| (op, BindingPower::left_assoc(prec as u8)))
+            .collect();
+        Self::new(ops_with_bp)
+    }
+
+    /// Look up an operator's binding power.
     /// Returns None if the operator is not in the table.
-    pub fn lookup(&self, op: &str) -> Option<u16> {
+    pub fn lookup(&self, op: &str) -> Option<BindingPower> {
         let first_char = op.chars().next()?;
         let idx = first_char as usize;
 
@@ -334,15 +374,15 @@ impl OperatorTable {
 
         match &self.entries[idx] {
             OperatorEntry::Alphanumeric | OperatorEntry::OperatorNotUsed => None,
-            OperatorEntry::Single(stored_op, prec) => {
+            OperatorEntry::Single(stored_op, bp) => {
                 if stored_op == op {
-                    Some(*prec)
+                    Some(*bp)
                 } else {
                     None
                 }
             }
             OperatorEntry::Contended(ops) => {
-                ops.iter().find(|(s, _)| s == op).map(|(_, prec)| *prec)
+                ops.iter().find(|(s, _)| s == op).map(|(_, bp)| *bp)
             }
         }
     }
@@ -784,7 +824,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
 
                 let tokk = Tokk {
                     span: Span::from_range(start, pos),
-                    content: TokkV::Token(op),
+                    content: TokkV::Operator(op),
                 };
                 let current = invocation_stack.last_mut().unwrap();
                 current.get_output().push(Toast::Tokk(tokk));
@@ -1029,7 +1069,12 @@ pub enum ToastAstV {
         span: Span,
         quote_type: QuoteType,
         value: String,
-    }
+    },
+    Operator {
+        span: Span,
+        operator: String,
+        arguments: Vec<Box<Toast>>,
+    },
 }
 
 
@@ -1044,8 +1089,9 @@ for $x:Quoted(Backticked) → ast::Atom($x)
 # tokens are just atoms
 for $x:Token → ToastAst::Atom($x)
 
-#if there are operator-llinked things within an indental head with a non-operator term at the end, the indental belongs to that non-operator stuff at the end
 %indental($o:operators $(x)?)($(y)*) → $o($x $y)
+
+#if there are operator-llinked things within an indental head with a non-operator term at the end, the indental belongs to that non-operator stuff at the end
 %indental(a@$($_ $_:operators)+ $y*)($z*) → $a %indental($y)($z)
 
 # convert all infix operator expressions to invocation asts
@@ -1097,19 +1143,13 @@ fn astrules(mut tokks: Vec<Toast>, operators:&[String], operator_table: &Operato
 }
 
 // status: I'm a bit burned out. It turns out that it's not going to be efficient to apply rules one after the other, so the conversion algorithm is going to be a lot less elegant than the spec, and proving that the algorithm agrees with the spec is cognitively draining.
+// well, If I can prove to myself that the faster code version of this is equivalent to applying rewrite rules in multiple passes, then I'm pretty sure that'd imply that a sufficiently smart rule applyer could also produce that code, so even if we don't have that now, it can probably be found later. So it's fine.
 
 fn astrules_sequence(toasts: &mut Vec<Toast>, operators: &[String], operator_table: &OperatorTable, errors: &mut Vec<Error>) {
     for toast in toasts {
         astrules_individual(toast, operators, operator_table, errors);
     }
-    // look for operators and if else sequences
-    for toast in toasts {
-        match toast {
-            Toast::Ast(ast) => {
-                match 
-            }
-        }
-    }
+    // TODO: look for operators and if else sequences (Pratt parsing goes here)
 }
 fn astrules_individual(toast: &mut Toast, operators: &[String], operator_table: &OperatorTable, errors: &mut Vec<Error>) {
     match toast {
@@ -1121,6 +1161,11 @@ fn astrules_individual(toast: &mut Toast, operators: &[String], operator_table: 
                 TokkV::Token(s) => ToastAst {
                     span,
                     v: ToastAstV::Atom { span, value: take(s) },
+                },
+                // Operators stay as operators (will be processed by Pratt parsing)
+                TokkV::Operator(s) => ToastAst {
+                    span,
+                    v: ToastAstV::Operator { span, operator: take(s), arguments: Vec::new() },
                 },
                 // Backtick quotes become atoms: for $x:Quoted(Backticked) → ast::Atom($x)
                 TokkV::Quoted(QuoteType::Backtick, s) => ToastAst {
@@ -1228,6 +1273,11 @@ fn astrules_individual(toast: &mut Toast, operators: &[String], operator_table: 
                         astrules_individual(stmt, operators, operator_table, errors);
                     }
                 }
+                ToastAstV::Operator { arguments, .. } => {
+                    for arg in arguments {
+                        astrules_individual(arg, operators, operator_table, errors);
+                    }
+                }
                 // Leaf nodes - no children to recurse into
                 ToastAstV::Comment { .. } | ToastAstV::Atom { .. } | ToastAstV::Quoted { .. } => {}
             }
@@ -1290,10 +1340,19 @@ mod tests {
     // Tokenizer Tests
     // ========================================================================
 
-    /// Helper to extract token string from Scrip
+    /// Helper to extract token or operator string from Toast
     fn as_token(tokk: &Toast) -> Option<&str> {
         match &tokk {
             Toast::Tokk(Tokk { content: TokkV::Token(s), .. }) => Some(s),
+            Toast::Tokk(Tokk { content: TokkV::Operator(s), .. }) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Helper to extract operator string from Toast
+    fn as_operator(tokk: &Toast) -> Option<&str> {
+        match &tokk {
+            Toast::Tokk(Tokk { content: TokkV::Operator(s), .. }) => Some(s),
             _ => None,
         }
     }
@@ -1302,6 +1361,7 @@ mod tests {
     fn as_token_from_tokk(tokk: &Tokk) -> Option<&str> {
         match &tokk.content {
             TokkV::Token(s) => Some(s),
+            TokkV::Operator(s) => Some(s),
             _ => None,
         }
     }
@@ -1333,7 +1393,7 @@ mod tests {
     }
 
     fn make_operator_table() -> OperatorTable {
-        OperatorTable::new(vec![
+        OperatorTable::from_precedence_list(vec![
             "=".to_string(),
             "+".to_string(),
             "-".to_string(),

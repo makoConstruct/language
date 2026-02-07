@@ -1,8 +1,19 @@
-Attempts to make a programming language.
+Attempts to make a programming language. Starting with The Perfect Syntax.
 
-What's here so far, just a parser, however, it's the perfect parser. It consists entirely of a minimalistic conversion from raw text to structured tokens, and then just 16 rewrite rules in mostly one pass which convert the parts into simple AST nodes.
+The project started when I thought I could see a way to spec The Perfect Syntax with a fairly simple step that converts a string into a token tree that captures indentation structure, then another quite simple step that converts everything the rest of the way using about 20 rewrite rules.
 
-The default syntax ("language") has infix operators, negotiable whitespace structuring, and no need of semicolons or even commas.
+This turned out not to be the case, or at least, I couldn't find the rewrite rules that would do it. I'm stumped mainly on
+
+```
+a + if c d else b + c
+```
+needing to parse to
+```
+a + if(c d else(b + c))
+```
+In some sense we need operator rules to have higher precedence than if else rules so that the end comes through as `else(b+c)` instead of `else(b) + c` (and this is even more critical for situations like `if c && c2 d + e else ...`) but also we want them to be lower precedence so that the begining comes out as `a + if(c ...` instead of `(a + if) c ...`. So we're paradoxed.
+
+But once I find the rewrite rules, or digest the inelegant reality of having to do this with something much uglier than rewrite rules, we will have The Perfect Syntax. it will have infix operators, negotiable whitespace structuring, and no need for semicolons or even commas.
 
 The syntax is like this:
 
@@ -32,14 +43,7 @@ ac =
     else 0
 ```
 
-Later on I'll be attempting type checking. Types with with full static evaluation, generics, value parameters, variance, maybe type inference but that's not what I want to think about just now, but it's going to need it if it is to be anything.
 
-And then garbage collection, note to self, go and see how Deno does it.
 
-And then wasm compilation.
 
-And then a very nice self-describing hash addressable object format.
-
-And then a database/OS and editor.
-
-And then some killer apps.
+Later on I'll be attempting type checking. Types with with full static evaluation, generics, value parameters, variance, maybe type inference but that's not what I want to think about just now, but it's going to need it if it is to be anything. And then garbage collection, note to self, go and see how Deno does it. And then wasm compilation. And then a very nice self-describing hash addressable object format. And then a database/OS and editor. And then some killer apps.
