@@ -1091,19 +1091,29 @@ for $x:Token → ToastAst::Atom($x)
 
 %indental($o:operators $(x)?)($(y)*) → $o($x $y)
 
+def %indenter = fn | if | do
+%indental(%lazy($b* $s:%indenter $a*))($d*) → $b %indental($s $a)($d)
+
 #if there are operator-llinked things within an indental head with a non-operator term at the end, the indental belongs to that non-operator stuff at the end
-%indental(a@$($_ $_:operators)+ $y*)($z*) → $a %indental($y)($z)
+%indental(a@$($_ $_@operators)+ $y*)($z*) → $a %indental($y)($z)
+
+def %operatorSequence = $($_ $_@operators)+ $f
+# inline if else (ternary)
+if($x*) else($y*) → if($x else $y)
+if $c@operatorSequence $x@operatorSequence else $y@operatorSequence → if($c $x else $y)
 
 # convert all infix operator expressions to invocation asts
-for $o in operators
-    to ast::Invocation(head($o) arguments($x $y))
-        $x $o $y
-        %indental($x* $o)($(y)*)
+to ast::Invocation(head($o) arguments($x $y))
+    $x $o@operators $y
+    %indental($x* $o@operators)($(y)*)
+
+
+if($c $x* else $y*) → ast::Conditional(condition:$c then:[$x] elsen:[$y])
 
 # normalize conditional parts
 to if($c $x)
     if $c $x
-    %indental(if $c)($x*)
+    %indental(if $c*)($x*)
 to elif($c $x)
     elif $c $x
     %indental(elif $c)($x*)
@@ -1126,7 +1136,8 @@ to ast::Function(parameters:[$parameters*] returnType:$return body:[$doings*])
     fn $parameters* :(to $return) $doings
 
 # all remaining indentals are invocations
-%indental($x*)($y*) → ast::Invocation(head:$x arguments:[$y*])
+%indental($x $xs*)($y*) → ast::Invocation(head:$x arguments:[$xs* $y*])
+%indental($x $xs* do)($y*) → ast::Invocation(head:$x arguments:[$xs* do($y*)])
 
 
 After this, in Result, all [Toast]s should be [ToastAst]s, no [Tokk]s should remain.
