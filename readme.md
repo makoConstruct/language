@@ -13,6 +13,8 @@ a + if(c d else(b + c))
 ```
 In some sense we need operator rules to have higher precedence than if else rules so that the end comes through as `else(b+c)` instead of `else(b) + c` (and this is even more critical for situations like `if c && c2 d + e else ...`) but also we want them to be lower precedence so that the begining comes out as `a + if(c ...` instead of `(a + if) c ...`. So we're paradoxed.
 
+We could also just do away with inline ternary if and only allow `if(c d) else(e)` and give if else sequencing higher precedence than operators.
+
 But once I find the rewrite rules, or digest the inelegant reality of having to do this with something much uglier than rewrite rules, we will have The Perfect Syntax. it will have infix operators, negotiable whitespace structuring, and no need for semicolons or even commas.
 
 The syntax is like this:
