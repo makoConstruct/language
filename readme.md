@@ -46,6 +46,14 @@ ac = do
 
 # fully explicit paren modes syntax is also always possible
 =(ac do(=(g fb(combined(=(a 2) =(b 2)))) +(g 3)))
+
+# we don't have default lists and maps and so on, all datastructures are constructed in the normal way, by naming them
+print
+    list(1 2 3 4).map(fn a to tuple(1 a)).reduce
+        tuple(0 0)
+        fn tuple(a b) tuple(c d)
+            a + b + c + d
+# > 14
 ```
 
 Later on I'll be attempting type checking. Types with static evaluation (typechecking is staggered with interpretation), generics, value parameters, variance, maybe type inference but that's not what I want to think about just now, but it's going to need it if it is to be anything. And then garbage collection (note to self, go and see how Deno does it). And then wasm compilation. And then a very nice self-describing hash addressable object format. And then a database/OS and editor. And then some killer apps.
