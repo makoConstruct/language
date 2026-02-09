@@ -9,7 +9,7 @@ But, the proposed/specced syntax has infix operators, negotiable whitespace stru
 The syntax might seem like it's not totally explicit about some things. But this is good. Explicitness isn't the syntax's job any more. We've been in the age of LSP-integrated editors for like 7 years at this point. The syntax doesn't have to tell you whether your `=` expression is a definition or a reassignment, the editor can just read the code and show you which it is with a visual hint. And we wont be explicit about conversions (`option[combined].into[combined]()` and so on) because the editor can flag whenever one's happening and tell you what it is if you click the flag.
 
 ```python
-f = fn(a:int b:int to:int a + b)
+f = fn a:int b:int to:int a + b
 print(f(1 2))
 # > 3
 
@@ -26,7 +26,7 @@ fc = fn c:combined to int
 
 # there's also generally a paren form of these things, and when you enter parens it gets a bit more permissive about how you do indentation.
 fb = fn(c:option[combined]
-    to:int
+    to #return type doesn't always have to be given
     # todo, define if let syntax
     if c.is_some()
         c.a + c.b
@@ -34,7 +34,7 @@ fb = fn(c:option[combined]
 
 c:option[combined] = some(combined(a = 2 b = 2))
 
-# operators interact with indentation gracefully
+# operators and functions interact with indentation gracefully
 ac = do
     g = fb
         combined

@@ -1080,8 +1080,7 @@ pub enum ToastAstV {
 
 /**
 the astrule step takes a sequence of [Toast]s that are initially all [Tokk]s and applies some rewrite rules to transform them into [Ast] Toasts, which are then stripped down into a tree of pure Asts.
-for each `for`, either the result must already be in the to [final state] form, or one of the following rules must match around its key term (which then take it to that final state), and that rule transforms it into an Ast. If no rule matches under a for expression, this is a syntax error. If there are no syntax errors, all remaining Tokks are converted to Tokens and the Ast is complete.
-`%reverse` means it's greedy but from the other direction, processing terms from the right first
+`%endfirst` means it's greedy but from the other direction, processing terms from the right first (this may be what lazy means in general for all I know, but I think endfirst is a much clearer term for this, it means it'll be intuitive if we also use this for right-associativity)
 The macro matching rule syntax here is pretty much taken from rust.
 
 # backtick quotes just translate to an atom, ie, we use them to allow expressing symbols with spaces in them.
@@ -1089,18 +1088,22 @@ for $x:Quoted(Backticked) → ast::Atom($x)
 # tokens are just atoms
 for $x:Token → ToastAst::Atom($x)
 
-%indental($o:operators $(x)?)($(y)*) → $o($x $y)
+# operators
 
 def %indenter = fn | if | do
-%indental(%lazy($b* $s:%indenter $a*))($d*) → $b %indental($s $a)($d)
+%indental(%endfirst($b* $s:%indenter $a*))($d*) → $b %indental($s $a)($d)
+
+%indental($o:operators $(x)?)($(y)*) → $o($x $y)
 
 #if there are operator-llinked things within an indental head with a non-operator term at the end, the indental belongs to that non-operator stuff at the end
 %indental(a@$($_ $_@operators)+ $y*)($z*) → $a %indental($y)($z)
 
-def %operatorSequence = $($_ $_@operators)+ $f
+def %operatorExpression = $($_ $_@operators)+ $f
 # inline if else (ternary)
 if($x*) else($y*) → if($x else $y)
-if $c@operatorSequence $x@operatorSequence else $y@operatorSequence → if($c $x else $y)
+if $c@operatorExpression $x@operatorExpression else $y@operatorExpression → if($c $x else $y)
+
+fn $p* to:$rt? $b@operatorExpression → fn($p* to$(:$rt)? $b)
 
 # convert all infix operator expressions to invocation asts
 to ast::Invocation(head($o) arguments($x $y))
@@ -1143,9 +1146,9 @@ to ast::Function(parameters:[$parameters*] returnType:$return body:[$doings*])
 After this, in Result, all [Toast]s should be [ToastAst]s, no [Tokk]s should remain.
 */
 
-fn astrules(mut tokks: Vec<Toast>, operators:&[String], operator_table: &OperatorTable) -> Result<(), Vec<Error>> {
+fn structure(mut tokks: Vec<Toast>, operators:&[String], operator_table: &OperatorTable) -> Result<(), Vec<Error>> {
     let mut errors = Vec::new();
-    astrules_sequence(&mut tokks, operators, operator_table, &mut errors);
+    structure_series(&mut tokks, operators, operator_table, &mut errors);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -1156,13 +1159,13 @@ fn astrules(mut tokks: Vec<Toast>, operators:&[String], operator_table: &Operato
 // status: I'm a bit burned out. It turns out that it's not going to be efficient to apply rules one after the other, so the conversion algorithm is going to be a lot less elegant than the spec, and proving that the algorithm agrees with the spec is cognitively draining.
 // well, If I can prove to myself that the faster code version of this is equivalent to applying rewrite rules in multiple passes, then I'm pretty sure that'd imply that a sufficiently smart rule applyer could also produce that code, so even if we don't have that now, it can probably be found later. So it's fine.
 
-fn astrules_sequence(toasts: &mut Vec<Toast>, operators: &[String], operator_table: &OperatorTable, errors: &mut Vec<Error>) {
+fn structure_series(toasts: &mut Vec<Toast>, operators: &[String], operator_table: &OperatorTable, errors: &mut Vec<Error>) {
     for toast in toasts {
-        astrules_individual(toast, operators, operator_table, errors);
+        structure_individual(toast, operators, operator_table, errors);
     }
     // TODO: look for operators and if else sequences (Pratt parsing goes here)
 }
-fn astrules_individual(toast: &mut Toast, operators: &[String], operator_table: &OperatorTable, errors: &mut Vec<Error>) {
+fn structure_individual(toast: &mut Toast, operators: &[String], operator_table: &OperatorTable, errors: &mut Vec<Error>) {
     match toast {
         Toast::Tokk(tokk) => {
             // Convert Tokk to ToastAst based on the rules
@@ -1203,7 +1206,7 @@ fn astrules_individual(toast: &mut Toast, operators: &[String], operator_table: 
                         .collect();
                     // Recurse into each parameter
                     for param in &mut parameters {
-                        astrules_individual(param, operators, operator_table, errors);
+                        structure_individual(param, operators, operator_table, errors);
                     }
                     ToastAst {
                         span,
@@ -1225,10 +1228,10 @@ fn astrules_individual(toast: &mut Toast, operators: &[String], operator_table: 
                     
                     // Recurse into root_line and indented toasts
                     for param in &mut root_params {
-                        astrules_individual(param, operators, operator_table, errors);
+                        structure_individual(param, operators, operator_table, errors);
                     }
                     for param in &mut indented_params {
-                        astrules_individual(param, operators, operator_table, errors);
+                        structure_individual(param, operators, operator_table, errors);
                     }
                     
                     // Combine all parameters - indental becomes an invocation
@@ -1256,37 +1259,37 @@ fn astrules_individual(toast: &mut Toast, operators: &[String], operator_table: 
             match &mut ast.v {
                 ToastAstV::Invocation { parameters, .. } => {
                     for param in parameters {
-                        astrules_individual(param, operators, operator_table, errors);
+                        structure_individual(param, operators, operator_table, errors);
                     }
                 }
                 ToastAstV::Conditional { condition, then, elsen, elsifs, .. } => {
-                    astrules_individual(condition, operators, operator_table, errors);
-                    astrules_individual(then, operators, operator_table, errors);
+                    structure_individual(condition, operators, operator_table, errors);
+                    structure_individual(then, operators, operator_table, errors);
                     if let Some(e) = elsen {
-                        astrules_individual(e, operators, operator_table, errors);
+                        structure_individual(e, operators, operator_table, errors);
                     }
                     for (cond, body) in elsifs {
-                        astrules_individual(cond, operators, operator_table, errors);
-                        astrules_individual(body, operators, operator_table, errors);
+                        structure_individual(cond, operators, operator_table, errors);
+                        structure_individual(body, operators, operator_table, errors);
                     }
                 }
                 ToastAstV::Function { args, return_type, body, .. } => {
                     for arg in args {
-                        astrules_individual(arg, operators, operator_table, errors);
+                        structure_individual(arg, operators, operator_table, errors);
                     }
                     if let Some(ret) = return_type {
-                        astrules_individual(ret, operators, operator_table, errors);
+                        structure_individual(ret, operators, operator_table, errors);
                     }
-                    astrules_individual(body, operators, operator_table, errors);
+                    structure_individual(body, operators, operator_table, errors);
                 }
                 ToastAstV::Block { statements, .. } => {
                     for stmt in statements {
-                        astrules_individual(stmt, operators, operator_table, errors);
+                        structure_individual(stmt, operators, operator_table, errors);
                     }
                 }
                 ToastAstV::Operator { arguments, .. } => {
                     for arg in arguments {
-                        astrules_individual(arg, operators, operator_table, errors);
+                        structure_individual(arg, operators, operator_table, errors);
                     }
                 }
                 // Leaf nodes - no children to recurse into
