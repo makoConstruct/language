@@ -76,7 +76,6 @@ pub enum QuoteType {
 
 #[derive(Debug)]
 pub enum TokkV {
-    Token(String),
     Operator(String),
     Quoted(QuoteType, String),
     // we're not using lines (we only need indental), but if anyone wants lines that'd make sense and they can have one
@@ -87,6 +86,37 @@ pub enum TokkV {
         root_line: Vec<Toast>,
         indented: Vec<Toast>,
     },
+}
+
+/// Equality comparison for TokkV ignoring spans
+impl PartialEq for TokkV {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (TokkV::Operator(a), TokkV::Operator(b)) => a == b,
+            (TokkV::Quoted(qt1, s1), TokkV::Quoted(qt2, s2)) => qt1 == qt2 && s1 == s2,
+            (TokkV::Invocation(pt1, c1, args1), TokkV::Invocation(pt2, c2, args2)) => {
+                pt1 == pt2 && c1 == c2 && args1 == args2
+            }
+            (
+                TokkV::Indental {
+                    root_line: r1,
+                    indented: i1,
+                },
+                TokkV::Indental {
+                    root_line: r2,
+                    indented: i2,
+                },
+            ) => r1 == r2 && i1 == i2,
+            _ => false,
+        }
+    }
+}
+
+/// Equality comparison for Tokk ignoring span
+impl PartialEq for Tokk {
+    fn eq(&self, other: &Self) -> bool {
+        self.content == other.content
+    }
 }
 
 /// Tracks the content accumulated at a given indentation level
@@ -406,6 +436,14 @@ fn is_digit(c: char) -> bool {
     c.is_ascii_digit()
 }
 
+/// Create a Toast::Ast containing an Atom with the given value
+fn make_atom(span: Span, value: String) -> Toast {
+    Toast::Ast(ToastAst {
+        span,
+        v: ToastAstV::Atom { span, value },
+    })
+}
+
 fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Vec<Error>> {
     use std::iter::Peekable;
     use std::str::Chars;
@@ -417,10 +455,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Vec<E
 
     // Stack of open invocations - bottom entry is never popped
     let mut invocation_stack: Vec<InvocationLevel> = vec![InvocationLevel {
-        caller: Toast::Tokk(Tokk {
-            span: Span::new(0, 2),
-            content: TokkV::Token("do".to_string()),
-        }),
+        caller: make_atom(Span::new(0, 0), "do".to_string()),
         paren_type: ParenType::Round,
         span_start: 0,
         known_indent: String::new(),
@@ -525,7 +560,8 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Vec<E
                 }
 
                 // Find if any level has indent_len <= new_len
-                let is_recognized_prefix = current.indent_stack.iter().any(|l| l.indent_len <= new_len);
+                let is_recognized_prefix =
+                    current.indent_stack.iter().any(|l| l.indent_len <= new_len);
 
                 if !is_recognized_prefix && !indent_mismatch {
                     errors.push(Error::new(
@@ -601,10 +637,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Vec<E
                             Span::new(pos, 1),
                             format!("Opening '{}' requires a caller - nothing precedes it", c),
                         ));
-                        Toast::Tokk(Tokk {
-                            span: Span::new(pos, 1),
-                            content: TokkV::Token("ERROR_DUMMY_TOKEN".into()),
-                        })
+                        make_atom(Span::new(pos, 1), "ERROR_DUMMY_TOKEN".into())
                     }
                 };
 
@@ -835,11 +868,12 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Vec<E
                         }
                     }
 
-                    let tokk = Tokk {
-                        span: Span::from_range(start, pos),
-                        content: TokkV::Token(content),
-                    };
-                    end_list(&mut invocation_stack).push(Toast::Tokk(tokk));
+                    let span = Span::from_range(start, pos);
+                    let comment = Toast::Ast(ToastAst {
+                        span,
+                        v: ToastAstV::Comment { span, content },
+                    });
+                    end_list(&mut invocation_stack).push(comment);
                 } else {
                     // Single-line comment
                     let mut content = String::from("#");
@@ -852,11 +886,12 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Vec<E
                         pos += 1;
                     }
 
-                    let tokk = Tokk {
-                        span: Span::from_range(start, pos),
-                        content: TokkV::Token(content),
-                    };
-                    end_list(&mut invocation_stack).push(Toast::Tokk(tokk));
+                    let span = Span::from_range(start, pos);
+                    let comment = Toast::Ast(ToastAst {
+                        span,
+                        v: ToastAstV::Comment { span, content },
+                    });
+                    end_list(&mut invocation_stack).push(comment);
                 }
             }
 
@@ -888,11 +923,8 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Vec<E
                 }
 
                 if !value.is_empty() {
-                    let tokk = Tokk {
-                        span: Span::from_range(start, pos),
-                        content: TokkV::Token(value),
-                    };
-                    end_list(&mut invocation_stack).push(Toast::Tokk(tokk));
+                    let atom = make_atom(Span::from_range(start, pos), value);
+                    end_list(&mut invocation_stack).push(atom);
                 }
             }
         }
@@ -921,10 +953,22 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Vec<E
 
 /// Token Or Ast
 #[derive(Debug)]
-enum Toast {
+pub enum Toast {
     Tokk(Tokk),
     Ast(ToastAst),
 }
+
+/// Equality comparison for Toast ignoring spans
+impl PartialEq for Toast {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Toast::Tokk(a), Toast::Tokk(b)) => a == b,
+            (Toast::Ast(a), Toast::Ast(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 impl Toast {
     fn as_tokk(&self) -> &Tokk {
         match self {
@@ -1055,6 +1099,97 @@ pub enum ToastAstV {
     },
 }
 
+/// Equality comparison for ToastAst ignoring span
+impl PartialEq for ToastAst {
+    fn eq(&self, other: &Self) -> bool {
+        self.v == other.v
+    }
+}
+
+/// Equality comparison for ToastAstV ignoring spans
+impl PartialEq for ToastAstV {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                ToastAstV::Invocation {
+                    head: h1,
+                    kind: k1,
+                    parameters: p1,
+                    ..
+                },
+                ToastAstV::Invocation {
+                    head: h2,
+                    kind: k2,
+                    parameters: p2,
+                    ..
+                },
+            ) => h1 == h2 && k1 == k2 && p1 == p2,
+            (ToastAstV::Comment { content: c1, .. }, ToastAstV::Comment { content: c2, .. }) => {
+                c1 == c2
+            }
+            (
+                ToastAstV::Conditional {
+                    condition: c1,
+                    then: t1,
+                    elsen: e1,
+                    elsifs: ei1,
+                    ..
+                },
+                ToastAstV::Conditional {
+                    condition: c2,
+                    then: t2,
+                    elsen: e2,
+                    elsifs: ei2,
+                    ..
+                },
+            ) => c1 == c2 && t1 == t2 && e1 == e2 && ei1 == ei2,
+            (
+                ToastAstV::Function {
+                    args: a1,
+                    return_type: r1,
+                    body: b1,
+                    ..
+                },
+                ToastAstV::Function {
+                    args: a2,
+                    return_type: r2,
+                    body: b2,
+                    ..
+                },
+            ) => a1 == a2 && r1 == r2 && b1 == b2,
+            (ToastAstV::Block { statements: s1, .. }, ToastAstV::Block { statements: s2, .. }) => {
+                s1 == s2
+            }
+            (ToastAstV::Atom { value: v1, .. }, ToastAstV::Atom { value: v2, .. }) => v1 == v2,
+            (
+                ToastAstV::Quoted {
+                    quote_type: q1,
+                    value: v1,
+                    ..
+                },
+                ToastAstV::Quoted {
+                    quote_type: q2,
+                    value: v2,
+                    ..
+                },
+            ) => q1 == q2 && v1 == v2,
+            (
+                ToastAstV::Operator {
+                    operator: o1,
+                    arguments: a1,
+                    ..
+                },
+                ToastAstV::Operator {
+                    operator: o2,
+                    arguments: a2,
+                    ..
+                },
+            ) => o1 == o2 && a1 == a2,
+            _ => false,
+        }
+    }
+}
+
 /**
 the astrule step takes a sequence of [Toast]s that are initially all [Tokk]s and applies some rewrite rules to transform them into [Ast] Toasts, which are then stripped down into a tree of pure Asts.
 `%endfirst` means it's greedy but from the other direction, processing terms from the right first (this may be what lazy means in general for all I know, but I think endfirst is a much clearer term for this, it means it'll be intuitive if we also use this for right-associativity)
@@ -1124,212 +1259,198 @@ After this, in Result, all [Toast]s should be [ToastAst]s, no [Tokk]s should rem
 */
 
 // converts every toast into a ToastAst, or reports errors
-// fn structure(
-//     tokks: &mut Vec<Toast>,
-//     operators: &[String],
-//     operator_table: &OperatorTable,
-// ) -> Result<(), Vec<Error>> {
-//     let mut errors = Vec::new();
-//     structure_series(&mut tokks, operators, operator_table, &mut errors);
-//     if errors.is_empty() {
-//         Ok(())
-//     } else {
-//         Err(errors)
-//     }
-// }
+fn structure(
+    tokks: &mut Vec<Toast>,
+    operators: &[String],
+    operator_table: &OperatorTable,
+) -> Result<(), Vec<Error>> {
+    let mut errors = Vec::new();
+    structure_series(tokks, operators, operator_table, &mut errors);
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
 
 // status: I'm a bit burned out. It turns out that it's not going to be efficient to apply rules one after the other, so the conversion algorithm is going to be a lot less elegant than the spec, and proving that the algorithm agrees with the spec is cognitively draining.
 // well, If I can prove to myself that the faster code version of this is equivalent to applying rewrite rules in multiple passes, then I'm pretty sure that'd imply that a sufficiently smart rule applyer could also produce that code, so even if we don't have that now, it can probably be found later. So it's fine.
 
-// fn structure_series(
-//     toasts: &mut Vec<Toast>,
-//     operators: &[String],
-//     operator_table: &OperatorTable,
-//     errors: &mut Vec<Error>,
-// ) {
-//     for toast in toasts {
-//         structure_individual(toast, operators, operator_table, errors);
-//     }
-//     // TODO: look for operators and if else sequences (Pratt parsing goes here)
-// }
-// fn structure_individual(
-//     toast: &mut Toast,
-//     operators: &[String],
-//     operator_table: &OperatorTable,
-//     errors: &mut Vec<Error>,
-// ) {
-//     match toast {
-//         Toast::Tokk(tokk) => {
-//             // Convert Tokk to ToastAst based on the rules
-//             let span = tokk.span;
-//             let new_ast = match &mut tokk.content {
-//                 // Tokens become atoms: for $x:Token → ast::Atom($x)
-//                 TokkV::Token(s) => ToastAst {
-//                     span,
-//                     v: ToastAstV::Atom {
-//                         span,
-//                         value: take(s),
-//                     },
-//                 },
-//                 // Operators stay as operators (will be processed by Pratt parsing)
-//                 TokkV::Operator(s) => ToastAst {
-//                     span,
-//                     v: ToastAstV::Operator {
-//                         span,
-//                         operator: take(s),
-//                         arguments: Vec::new(),
-//                     },
-//                 },
-//                 // Backtick quotes become atoms: for $x:Quoted(Backticked) → ast::Atom($x)
-//                 TokkV::Quoted(QuoteType::Backtick, s) => ToastAst {
-//                     span,
-//                     v: ToastAstV::Atom {
-//                         span,
-//                         value: take(s),
-//                     },
-//                 },
-//                 // Other quotes stay as quoted
-//                 TokkV::Quoted(quote_type, s) => ToastAst {
-//                     span,
-//                     v: ToastAstV::Quoted {
-//                         span,
-//                         quote_type: *quote_type,
-//                         value: take(s),
-//                     },
-//                 },
-//                 // Invocations: convert to ast::Invocation and recurse into arguments
-//                 TokkV::Invocation(paren_type, caller, args) => {
-//                     let head = caller
-//                         .as_mut_ref()
-//                         .map(|c| match c.as_ref() {
-//                             Toast::Tokk(Tokk {
-//                                 content: TokkV::Token(s),
-//                                 ..
-//                             }) => s.clone(),
-//                             _ => String::new(),
-//                         })
-//                         .unwrap_or_default();
-//                     let kind = *paren_type;
-//                     let mut parameters: Vec<Box<Toast>> =
-//                         take(args).into_iter().map(Box::new).collect();
-//                     // Recurse into each parameter
-//                     for param in &mut parameters {
-//                         structure_individual(param, operators, operator_table, errors);
-//                     }
-//                     ToastAst {
-//                         span,
-//                         v: ToastAstV::Invocation {
-//                             span,
-//                             head,
-//                             kind,
-//                             parameters,
-//                         },
-//                     }
-//                 }
-//                 // Indentals: these need special handling based on the rules
-//                 TokkV::Indental {
-//                     root_line,
-//                     indented,
-//                 } => {
-//                     // For now, convert to an invocation with root_line as head context
-//                     // and indented as body - this matches %indental patterns
-//                     let mut root_params: Vec<Box<Toast>> =
-//                         take(root_line).into_iter().map(Box::new).collect();
-//                     let mut indented_params: Vec<Box<Toast>> =
-//                         take(indented).into_iter().map(Box::new).collect();
+fn structure_series(
+    toasts: &mut Vec<Toast>,
+    operators: &[String],
+    operator_table: &OperatorTable,
+    errors: &mut Vec<Error>,
+) {
+    for toast in toasts {
+        structure_individual(toast, operators, operator_table, errors);
+    }
+    // TODO: look for operators and if else sequences (Pratt parsing goes here)
+}
+fn structure_individual(
+    toast: &mut Toast,
+    operators: &[String],
+    operator_table: &OperatorTable,
+    errors: &mut Vec<Error>,
+) {
+    match toast {
+        Toast::Tokk(tokk) => {
+            // Convert Tokk to ToastAst based on the rules
+            let span = tokk.span;
+            let new_ast = match &mut tokk.content {
+                // Operators stay as operators (will be processed by Pratt parsing)
+                TokkV::Operator(s) => ToastAst {
+                    span,
+                    v: ToastAstV::Operator {
+                        span,
+                        operator: take(s),
+                        arguments: Vec::new(),
+                    },
+                },
+                // Backtick quotes become atoms: for $x:Quoted(Backticked) → ast::Atom($x)
+                TokkV::Quoted(QuoteType::Backtick, s) => ToastAst {
+                    span,
+                    v: ToastAstV::Atom {
+                        span,
+                        value: take(s),
+                    },
+                },
+                // Other quotes stay as quoted
+                TokkV::Quoted(quote_type, s) => ToastAst {
+                    span,
+                    v: ToastAstV::Quoted {
+                        span,
+                        quote_type: *quote_type,
+                        value: take(s),
+                    },
+                },
+                // Invocations: convert to ast::Invocation and recurse into arguments
+                TokkV::Invocation(paren_type, caller, args) => {
+                    let head = match caller.as_ref() {
+                        Toast::Ast(ToastAst { v: ToastAstV::Atom { value, .. }, .. }) => value.clone(),
+                        _ => String::new(),
+                    };
+                    let kind = *paren_type;
+                    let mut parameters: Vec<Box<Toast>> =
+                        take(args).into_iter().map(Box::new).collect();
+                    // Recurse into each parameter
+                    for param in &mut parameters {
+                        structure_individual(param, operators, operator_table, errors);
+                    }
+                    ToastAst {
+                        span,
+                        v: ToastAstV::Invocation {
+                            span,
+                            head,
+                            kind,
+                            parameters,
+                        },
+                    }
+                }
+                // Indentals: these need special handling based on the rules
+                TokkV::Indental {
+                    root_line,
+                    indented,
+                } => {
+                    // For now, convert to an invocation with root_line as head context
+                    // and indented as body - this matches %indental patterns
+                    let mut root_params: Vec<Box<Toast>> =
+                        take(root_line).into_iter().map(Box::new).collect();
+                    let mut indented_params: Vec<Box<Toast>> =
+                        take(indented).into_iter().map(Box::new).collect();
 
-//                     // Recurse into root_line and indented toasts
-//                     for param in &mut root_params {
-//                         structure_individual(param, operators, operator_table, errors);
-//                     }
-//                     for param in &mut indented_params {
-//                         structure_individual(param, operators, operator_table, errors);
-//                     }
+                    // Recurse into root_line and indented toasts
+                    for param in &mut root_params {
+                        structure_individual(param, operators, operator_table, errors);
+                    }
+                    for param in &mut indented_params {
+                        structure_individual(param, operators, operator_table, errors);
+                    }
 
-//                     // Combine all parameters - indental becomes an invocation
-//                     let mut all_params = root_params;
-//                     all_params.extend(indented_params);
+                    // Combine all parameters - indental becomes an invocation
+                    let mut all_params = root_params;
+                    all_params.extend(indented_params);
 
-//                     // Try to extract head from first token if available
-//                     let head = all_params
-//                         .first()
-//                         .and_then(|p| match p.as_ref() {
-//                             Toast::Ast(ToastAst {
-//                                 v: ToastAstV::Atom { value, .. },
-//                                 ..
-//                             }) => Some(value.clone()),
-//                             _ => None,
-//                         })
-//                         .unwrap_or_default();
+                    // Try to extract head from first token if available
+                    let head = all_params
+                        .first()
+                        .and_then(|p| match p.as_ref() {
+                            Toast::Ast(ToastAst {
+                                v: ToastAstV::Atom { value, .. },
+                                ..
+                            }) => Some(value.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
 
-//                     ToastAst {
-//                         span,
-//                         v: ToastAstV::Invocation {
-//                             span,
-//                             head,
-//                             kind: ParenType::Round,
-//                             parameters: all_params,
-//                         },
-//                     }
-//                 }
-//             };
-//             *toast = Toast::Ast(new_ast);
-//         }
-//         Toast::Ast(ast) => {
-//             // no conversion, just recurses
-//             match &mut ast.v {
-//                 ToastAstV::Invocation { parameters, .. } => {
-//                     for param in parameters {
-//                         structure_individual(param, operators, operator_table, errors);
-//                     }
-//                 }
-//                 ToastAstV::Conditional {
-//                     condition,
-//                     then,
-//                     elsen,
-//                     elsifs,
-//                     ..
-//                 } => {
-//                     structure_individual(condition, operators, operator_table, errors);
-//                     structure_individual(then, operators, operator_table, errors);
-//                     if let Some(e) = elsen {
-//                         structure_individual(e, operators, operator_table, errors);
-//                     }
-//                     for (cond, body) in elsifs {
-//                         structure_individual(cond, operators, operator_table, errors);
-//                         structure_individual(body, operators, operator_table, errors);
-//                     }
-//                 }
-//                 ToastAstV::Function {
-//                     args,
-//                     return_type,
-//                     body,
-//                     ..
-//                 } => {
-//                     for arg in args {
-//                         structure_individual(arg, operators, operator_table, errors);
-//                     }
-//                     if let Some(ret) = return_type {
-//                         structure_individual(ret, operators, operator_table, errors);
-//                     }
-//                     structure_individual(body, operators, operator_table, errors);
-//                 }
-//                 ToastAstV::Block { statements, .. } => {
-//                     for stmt in statements {
-//                         structure_individual(stmt, operators, operator_table, errors);
-//                     }
-//                 }
-//                 ToastAstV::Operator { arguments, .. } => {
-//                     for arg in arguments {
-//                         structure_individual(arg, operators, operator_table, errors);
-//                     }
-//                 }
-//                 // Leaf nodes - no children to recurse into
-//                 ToastAstV::Comment { .. } | ToastAstV::Atom { .. } | ToastAstV::Quoted { .. } => {}
-//             }
-//         }
-//     }
-// }
+                    ToastAst {
+                        span,
+                        v: ToastAstV::Invocation {
+                            span,
+                            head,
+                            kind: ParenType::Round,
+                            parameters: all_params,
+                        },
+                    }
+                }
+            };
+            *toast = Toast::Ast(new_ast);
+        }
+        Toast::Ast(ast) => {
+            // no conversion, just recurses
+            match &mut ast.v {
+                ToastAstV::Invocation { parameters, .. } => {
+                    for param in parameters {
+                        structure_individual(param, operators, operator_table, errors);
+                    }
+                }
+                ToastAstV::Conditional {
+                    condition,
+                    then,
+                    elsen,
+                    elsifs,
+                    ..
+                } => {
+                    structure_individual(condition, operators, operator_table, errors);
+                    structure_individual(then, operators, operator_table, errors);
+                    if let Some(e) = elsen {
+                        structure_individual(e, operators, operator_table, errors);
+                    }
+                    for (cond, body) in elsifs {
+                        structure_individual(cond, operators, operator_table, errors);
+                        structure_individual(body, operators, operator_table, errors);
+                    }
+                }
+                ToastAstV::Function {
+                    args,
+                    return_type,
+                    body,
+                    ..
+                } => {
+                    for arg in args {
+                        structure_individual(arg, operators, operator_table, errors);
+                    }
+                    if let Some(ret) = return_type {
+                        structure_individual(ret, operators, operator_table, errors);
+                    }
+                    structure_individual(body, operators, operator_table, errors);
+                }
+                ToastAstV::Block { statements, .. } => {
+                    for stmt in statements {
+                        structure_individual(stmt, operators, operator_table, errors);
+                    }
+                }
+                ToastAstV::Operator { arguments, .. } => {
+                    for arg in arguments {
+                        structure_individual(arg, operators, operator_table, errors);
+                    }
+                }
+                // Leaf nodes - no children to recurse into
+                ToastAstV::Comment { .. } | ToastAstV::Atom { .. } | ToastAstV::Quoted { .. } => {}
+            }
+        }
+    }
+}
 
 // struct Alteration<'a> {
 //     remove: Vec<TastID>,
@@ -1382,17 +1503,19 @@ mod tests {
     // Tokenizer Tests
     // ========================================================================
 
-    /// Helper to extract token or operator string from Toast
-    fn as_token(tokk: &Toast) -> Option<&str> {
-        match &tokk {
-            Toast::Tokk(Tokk {
-                content: TokkV::Token(s),
-                ..
-            }) => Some(s),
-            Toast::Tokk(Tokk {
-                content: TokkV::Operator(s),
-                ..
-            }) => Some(s),
+    /// Helper to extract atom value or operator string from Toast
+    fn as_token(toast: &Toast) -> Option<&str> {
+        match toast {
+            Toast::Ast(ToastAst { v: ToastAstV::Atom { value, .. }, .. }) => Some(value),
+            Toast::Tokk(Tokk { content: TokkV::Operator(s), .. }) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Helper to extract comment content from Toast
+    fn as_comment(toast: &Toast) -> Option<&str> {
+        match toast {
+            Toast::Ast(ToastAst { v: ToastAstV::Comment { content, .. }, .. }) => Some(content),
             _ => None,
         }
     }
@@ -1408,10 +1531,9 @@ mod tests {
         }
     }
 
-    /// Helper to extract token string from Tokk directly
-    fn as_token_from_tokk(tokk: &Tokk) -> Option<&str> {
+    /// Helper to extract operator string from Tokk directly
+    fn as_operator_from_tokk(tokk: &Tokk) -> Option<&str> {
         match &tokk.content {
-            TokkV::Token(s) => Some(s),
             TokkV::Operator(s) => Some(s),
             _ => None,
         }
@@ -1493,6 +1615,18 @@ mod tests {
             ("!".into(), BindingInfo::prefix()),
             ("?".into(), BindingInfo::prefix()),
         ])
+    }
+    fn make_token(t: &str) -> Toast {
+        make_atom(Span::new(0, t.len()), t.into())
+    }
+    fn make_indented(root_line: Vec<Toast>, indented: Vec<Toast>) -> Toast {
+        Toast::Tokk(Tokk {
+            span: Span::new(0, 0), // ignored by PartialEq
+            content: TokkV::Indental {
+                root_line,
+                indented,
+            },
+        })
     }
 
     #[test]
@@ -1638,7 +1772,7 @@ mod tests {
         let scrips = sequence("a # this is a comment\nb", &ops).expect("should tokenize");
         assert_eq!(scrips.len(), 3);
         assert_eq!(as_token(&scrips[0]), Some("a"));
-        assert!(as_token(&scrips[1]).unwrap().starts_with("#"));
+        assert!(as_comment(&scrips[1]).unwrap().starts_with("#"));
         assert_eq!(as_token(&scrips[2]), Some("b"));
     }
 
@@ -1648,7 +1782,7 @@ mod tests {
         let scrips = sequence("a #(multi\nline) b", &ops).expect("should tokenize");
         assert_eq!(scrips.len(), 3);
         assert_eq!(as_token(&scrips[0]), Some("a"));
-        let comment = as_token(&scrips[1]).unwrap();
+        let comment = as_comment(&scrips[1]).unwrap();
         assert!(comment.starts_with("#("));
         assert!(comment.contains("multi"));
         assert_eq!(as_token(&scrips[2]), Some("b"));
@@ -1894,7 +2028,10 @@ mod tests {
         let result = sequence("a\n  b\n\tc", &ops);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("Inconsistent indentation")));
+        assert!(
+            err.iter()
+                .any(|e| e.message.contains("Inconsistent indentation"))
+        );
     }
 
     #[test]
@@ -1930,7 +2067,10 @@ mod tests {
         let result = sequence("f(\n  a\n\tb\n)", &ops);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.iter().any(|e| e.message.contains("Inconsistent indentation")));
+        assert!(
+            err.iter()
+                .any(|e| e.message.contains("Inconsistent indentation"))
+        );
     }
 
     #[test]
@@ -1984,6 +2124,35 @@ mod tests {
 
         // Second is d at root level
         assert_eq!(as_token(&scrips[1]), Some("d"));
+    }
+
+    #[test]
+    fn test_tokenize_multi_sibling_indent_and_compare_ast() {
+        let ops = make_operator_table();
+        // multiline: a
+        //   b
+        //   c
+        //   b
+        //   c
+        //
+        // Should construct: Indental{a, [b, c, b, c]}
+        let tokks = sequence("a\n  b\n   c\n  b\n   c", &ops).expect("should tokenize");
+
+        assert_eq!(tokks.len(), 1);
+
+        // The produced structure should be:
+        // TokkV::Indental { root_line: [a], indented: [b, c, b, c] }
+        use TokkV::*;
+
+        let expected = make_indented(
+            vec![make_token("a")],
+            vec![
+                make_indented(vec![make_token("b")], vec![make_token("c")]),
+                make_indented(vec![make_token("b")], vec![make_token("c")]),
+            ],
+        );
+
+        assert_eq!(tokks[0], expected, "AST structure does not match");
     }
 
     #[test]

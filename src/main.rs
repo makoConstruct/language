@@ -3,7 +3,7 @@
 //parser: first it just paren match, then use the matched parens to parse into a Vec of Asts
 
 use std::{any::Any, collections::HashMap};
-mod parser;
+pub mod parser;
 use crate::parser::{Error, Span};
 
 use std::fmt;
