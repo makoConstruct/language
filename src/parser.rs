@@ -1,13 +1,10 @@
-
-
 // overview: This is a very flexible parser for languages that may or may not use indentation to structure, which have a fixed number of infix operators, with precedence. This was entirely sufficient to implement the quite sophisticated syntax of the ~~Bjork~~Kaba language.
 // the tokenizer converts a string into Scrips, which are sometimes like tokens, other times richer and more structured, as they can retain indent structure. The Scrips are then transformed through term rewriting into Asts.
 // keywords: fn, to, if, else, elif
 
-
 use std::mem::take;
 
-use crate::{Ref, Arena};
+use crate::{Arena, Ref};
 /*
 The example input:
 
@@ -41,7 +38,6 @@ ac =
 
 */
 
-
 #[derive(Debug, Clone, Copy)]
 pub struct Span {
     pub start: usize,
@@ -58,6 +54,9 @@ impl Span {
             start,
             length: end.saturating_sub(start),
         }
+    }
+    pub fn end(&self) -> usize {
+        self.start + self.length
     }
 }
 
@@ -83,7 +82,7 @@ pub enum TokkV {
     // we're not using lines (we only need indental), but if anyone wants lines that'd make sense and they can have one
     // Line(Vec<Toast>)
     /// Invocation: paren type, optional caller (the token before the paren), and arguments
-    Invocation(ParenType, Option<Box<Toast>>, Vec<Toast>),
+    Invocation(ParenType, Box<Toast>, Vec<Toast>),
     Indental {
         root_line: Vec<Toast>,
         indented: Vec<Toast>,
@@ -94,10 +93,9 @@ pub enum TokkV {
 struct IndentLevel {
     /// Length of the indent prefix within the parent InvocationLevel's known_indent
     indent_len: usize,
-    /// The scrips accumulated at this indent level (the root line, before any sub-indent)
-    root_line: Vec<Toast>,
-    /// The scrips accumulated in indented sub-content
-    indented: Vec<Toast>,
+    /// index of the first token on the final line
+    line_start: usize,
+    content: Vec<Toast>,
     /// Span start for this indent level
     span_start: usize,
 }
@@ -105,89 +103,63 @@ struct IndentLevel {
 /// Tracks open invocations (paren groups) and their associated indent state
 struct InvocationLevel {
     /// None for root level, Some for actual parens
-    paren_type: Option<ParenType>,
+    paren_type: ParenType,
     /// The token that preceded the opening paren (the "caller"), if any
-    caller: Option<Toast>,
+    caller: Toast,
     span_start: usize,
     /// The known indent string - extended as indent_stack grows, shortened as it pops
     known_indent: String,
     /// Indent stack for this invocation level
     indent_stack: Vec<IndentLevel>,
-    /// Content accumulated inside this invocation
-    content: Vec<Toast>,
 }
 
 impl InvocationLevel {
     /// Get the current output destination within this invocation level.
     /// Uses `indented` if it's non-empty (meaning we've seen sub-content), otherwise `root_line`.
-    fn get_output(&mut self) -> &mut Vec<Toast> {
-        if let Some(indent) = self.indent_stack.last_mut() {
-            if !indent.indented.is_empty() {
-                &mut indent.indented
-            } else {
-                &mut indent.root_line
-            }
+    fn end_list(&mut self) -> &mut Vec<Toast> {
+        &mut self.indent_stack.last_mut().unwrap().content
+    }
+
+    fn pop_close_indent_level(&mut self) {
+        // finalize level by collecting root_line and indented content
+        let indented = self.indent_stack.pop().unwrap().content;
+        let host = self.indent_stack.last_mut().unwrap();
+        let root_line: Vec<_> = host.content.drain(host.line_start..).collect();
+
+        if root_line.is_empty() {
+            // No root line - just merge indented content into parent
+            host.content.extend(indented);
         } else {
-            &mut self.content
+            // Create an Indental with root_line and indented content
+            let span = {
+                let start = root_line.first().unwrap().span().start;
+                let end = indented
+                    .last()
+                    .map(|t| t.span().end())
+                    .unwrap_or_else(|| root_line.last().unwrap().span().end());
+                Span::from_range(start, end)
+            };
+
+            host.content.push(Toast::Tokk(Tokk {
+                span,
+                content: TokkV::Indental {
+                    root_line,
+                    indented,
+                },
+            }));
         }
+
+        self.known_indent.truncate(host.indent_len);
     }
 
     /// Flush all indent levels, collapsing them into content
-    fn flush_indents(&mut self, end_pos: usize) {
-        while let Some(finished) = self.indent_stack.pop() {
-            finalize_indent_level_into(
-                &mut self.indent_stack,
-                &mut self.content,
-                finished,
-                end_pos,
-            );
+    /// called when the end of a paren level is reached
+    fn pop_all_indents(&mut self, end_pos: usize) {
+        while self.indent_stack.len() > 1 {
+            self.pop_close_indent_level();
         }
     }
 }
-
-/// Finalize a popped indent level, either merging or creating an Indental
-fn finalize_indent_level(paren: &mut InvocationLevel, finished: IndentLevel, end_pos: usize) {
-    finalize_indent_level_into(
-        &mut paren.indent_stack,
-        &mut paren.content,
-        finished,
-        end_pos,
-    );
-}
-
-/// Helper to finalize an indent level into the given parent stack/content
-fn finalize_indent_level_into(
-    indent_stack: &mut Vec<IndentLevel>,
-    content: &mut Vec<Toast>,
-    finished: IndentLevel,
-    end_pos: usize,
-) {
-    if finished.indented.is_empty() {
-        // No sub-content at this level - just merge root_line into parent's indented
-        // (since this level was sub-content of the parent)
-        if let Some(parent) = indent_stack.last_mut() {
-            parent.indented.extend(finished.root_line);
-        } else {
-            content.extend(finished.root_line);
-        }
-    } else {
-        // Has sub-content, create an Indental
-        let tokk = Toast::Tokk(Tokk {
-            span: Span::from_range(finished.span_start, end_pos),
-            content: TokkV::Indental {
-                root_line: finished.root_line,
-                indented: finished.indented,
-            },
-        });
-        if let Some(parent) = indent_stack.last_mut() {
-            parent.indented.push(tokk);
-        } else {
-            content.push(tokk);
-        }
-    }
-}
-
-
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ParenType {
@@ -224,7 +196,6 @@ impl ParenType {
     }
 }
 
-
 #[derive(Debug)]
 pub struct Error {
     pub span: Span,
@@ -253,19 +224,18 @@ impl Error {
 
 /// Characters that can be part of operators (but may not be used in current config)
 const OPERATOR_CHARS: &[char] = &[
-    '=', ':', '+', '-', '*', '/', '%', '<', '>', '!', '.', '&', '|', '^', ';', '~', '@', '$', '?',
+    '=', ':', '+', '-', '*', '/', '<', '>', '!', '.', '&', '|', '^', ';', '~', '?',
 ];
 
 /// Binding power for an operator - determines precedence and associativity.
 /// For left-associative ops: l_bp < r_bp (e.g., + is (11, 12))
 /// For right-associative ops: l_bp > r_bp (e.g., = is (2, 1))
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct BindingPower {
+pub struct BindingInfo {
     pub left: u8,
     pub right: u8,
 }
-
-impl BindingPower {
+impl BindingInfo {
     /// Create a left-associative binding power at the given precedence level.
     /// Uses (level * 2 + 1, level * 2 + 2) to leave room for right-associative ops.
     pub fn left_assoc(precedence: u8) -> Self {
@@ -283,21 +253,31 @@ impl BindingPower {
             right: precedence * 2 + 1,
         }
     }
+
+    /// Create a prefix unary operator (like `!` or `?`).
+    /// Left is 0 (nothing to bind on left).
+    pub fn prefix() -> Self {
+        Self { left: 0, right: 0 }
+    }
+
+    pub fn is_prefix(&self) -> bool {
+        self.left == 0 && self.right == 0
+    }
 }
 
 /// Entry in the operator lookup table, indexed by first character of operator.
 #[derive(Debug, Clone)]
 pub enum OperatorEntry {
     /// This character can never be an operator (alphanumeric, whitespace, etc.)
-    Alphanumeric,
+    NonOperator,
     /// This character could be an operator but isn't used in the current operator list
     OperatorNotUsed,
     /// Exactly one operator starts with this character.
     /// Stores (full operator string, binding power).
-    Single(String, BindingPower),
+    Single(String, BindingInfo),
     /// Multiple operators start with this character, need disambiguation.
     /// Stores vec of (full operator string, binding power).
-    Contended(Vec<(String, BindingPower)>),
+    Contended(Vec<(String, BindingInfo)>),
 }
 
 /// Fast operator precedence lookup table.
@@ -309,11 +289,11 @@ pub struct OperatorTable {
 
 impl OperatorTable {
     /// Build an operator table from a list of (operator, binding_power) pairs.
-    pub fn new(operators: Vec<(String, BindingPower)>) -> Self {
+    pub fn new(operators: Vec<(String, BindingInfo)>) -> Self {
         use std::collections::HashMap;
 
         // Initialize all entries as Alphanumeric
-        let mut entries: Vec<OperatorEntry> = vec![OperatorEntry::Alphanumeric; 128];
+        let mut entries: Vec<OperatorEntry> = vec![OperatorEntry::NonOperator; 128];
 
         // Mark all potential operator characters as OperatorNotUsed
         for &c in OPERATOR_CHARS {
@@ -324,14 +304,11 @@ impl OperatorTable {
         }
 
         // Group operators by their first character
-        let mut by_first_char: HashMap<char, Vec<(String, BindingPower)>> = HashMap::new();
+        let mut by_first_char: HashMap<char, Vec<(String, BindingInfo)>> = HashMap::new();
 
         for (op, bp) in operators {
             if let Some(first_char) = op.chars().next() {
-                by_first_char
-                    .entry(first_char)
-                    .or_default()
-                    .push((op, bp));
+                by_first_char.entry(first_char).or_default().push((op, bp));
             }
         }
 
@@ -354,17 +331,17 @@ impl OperatorTable {
     /// Build an operator table from a list of operators in precedence order.
     /// All operators are left-associative. Index 0 = lowest precedence.
     pub fn from_precedence_list(operators: Vec<String>) -> Self {
-        let ops_with_bp: Vec<(String, BindingPower)> = operators
+        let ops_with_bp: Vec<(String, BindingInfo)> = operators
             .into_iter()
             .enumerate()
-            .map(|(prec, op)| (op, BindingPower::left_assoc(prec as u8)))
+            .map(|(prec, op)| (op, BindingInfo::left_assoc(prec as u8)))
             .collect();
         Self::new(ops_with_bp)
     }
 
-    /// Look up an operator's binding power.
-    /// Returns None if the operator is not in the table.
-    pub fn lookup(&self, op: &str) -> Option<BindingPower> {
+    /// Look up an operator's binding power, or a default lowest binding power if it's an unrecognized operator.
+    /// Returns None if the string doesn't consist of operator characters.
+    pub fn lookup(&self, op: &str) -> Option<BindingInfo> {
         let first_char = op.chars().next()?;
         let idx = first_char as usize;
 
@@ -372,8 +349,9 @@ impl OperatorTable {
             return None;
         }
 
-        match &self.entries[idx] {
-            OperatorEntry::Alphanumeric | OperatorEntry::OperatorNotUsed => None,
+        let found = match &self.entries[idx] {
+            OperatorEntry::NonOperator => return None,
+            OperatorEntry::OperatorNotUsed => None,
             OperatorEntry::Single(stored_op, bp) => {
                 if stored_op == op {
                     Some(*bp)
@@ -381,10 +359,14 @@ impl OperatorTable {
                     None
                 }
             }
-            OperatorEntry::Contended(ops) => {
-                ops.iter().find(|(s, _)| s == op).map(|(_, bp)| *bp)
-            }
+            OperatorEntry::Contended(ops) => ops.iter().find(|(s, _)| s == op).map(|(_, bp)| *bp),
+        };
+        // technically it doesn't need to check that all the chars are operator chars, if they weren't, it either would have early returned above, or the sequencing would have separated those into another token. But this code (unrecognized operators) is rarely run, it's otherwise an error.
+        if found.is_none() && op.chars().all(|c| self.is_operator_char(c)) {
+            // BindingPower(0, 1) means minimal precedence
+            return Some(BindingInfo::left_assoc(0));
         }
+        found
     }
 
     /// Check if a character is an operator character (could be part of an operator).
@@ -395,7 +377,7 @@ impl OperatorTable {
         if idx >= 128 {
             return false;
         }
-        !matches!(self.entries[idx], OperatorEntry::Alphanumeric)
+        !matches!(self.entries[idx], OperatorEntry::NonOperator)
     }
 
     /// Check if a character starts a registered operator (Single or Contended only).
@@ -424,52 +406,67 @@ fn is_digit(c: char) -> bool {
     c.is_ascii_digit()
 }
 
-
-
-fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error> {
+fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Vec<Error>> {
     use std::iter::Peekable;
     use std::str::Chars;
 
     let mut pos: usize = 0;
     let mut chars: Peekable<Chars> = source.chars().peekable();
 
-    // Stack of open invocations - bottom entry (None type) is never popped
+    let mut errors: Vec<Error> = Vec::new();
+
+    // Stack of open invocations - bottom entry is never popped
     let mut invocation_stack: Vec<InvocationLevel> = vec![InvocationLevel {
-        caller: None,
-        paren_type: None,
+        caller: Toast::Tokk(Tokk {
+            span: Span::new(0, 2),
+            content: TokkV::Token("do".to_string()),
+        }),
+        paren_type: ParenType::Round,
         span_start: 0,
         known_indent: String::new(),
-        indent_stack: Vec::new(),
-        content: Vec::new(),
+        indent_stack: vec![IndentLevel {
+            indent_len: 0,
+            line_start: 0,
+            content: Vec::new(),
+            span_start: 0,
+        }],
     }];
+
+    fn end_list(invocation_stack: &mut Vec<InvocationLevel>) -> &mut Vec<Toast> {
+        &mut invocation_stack
+            .last_mut()
+            .unwrap()
+            .indent_stack
+            .last_mut()
+            .unwrap()
+            .content
+    }
 
     // Track if we're at the start of a line (for indent processing)
     let mut at_line_start = true;
 
-    while chars.peek().is_some() {
+    'entire: while chars.peek().is_some() {
         // Handle line starts - measure indentation
         if at_line_start {
             let indent_start = pos;
             let current = invocation_stack.last_mut().unwrap();
-            let base_len = if let Some(l) = current.indent_stack.last() { l.indent_len } else { 0 };
-            
+            let base_len = current.indent_stack.last().unwrap().indent_len;
+
             // Read whitespace, comparing against known_indent and extending if deeper
             let mut new_len = 0;
-            let mut mismatch_at: Option<usize> = None;
-            
+            let mut indent_mismatch = false;
+
             loop {
                 match chars.peek() {
                     Some(&' ') | Some(&'\t') => {
                         let c = *chars.peek().unwrap();
                         chars.next();
                         pos += 1;
-                        
+
                         if new_len < base_len {
                             // Compare against existing pattern
                             if current.known_indent.as_bytes()[new_len] != c as u8 {
-                                if mismatch_at.is_none() {
-                                    mismatch_at = Some(new_len);
-                                }
+                                indent_mismatch = true;
                             }
                         } else {
                             // Extending beyond base - add to known_indent
@@ -488,7 +485,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                         // Reset any extension we made
                         current.known_indent.truncate(base_len);
                         new_len = 0;
-                        mismatch_at = None;
+                        indent_mismatch = false;
                     }
                     Some(&'\n') => {
                         // Empty line - consume and restart
@@ -496,7 +493,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                         pos += 1;
                         current.known_indent.truncate(base_len);
                         new_len = 0;
-                        mismatch_at = None;
+                        indent_mismatch = false;
                     }
                     _ => break,
                 }
@@ -510,52 +507,38 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
 
             // Check if the first non-whitespace char is a closing bracket, abandon indenting if so
             let next_char = chars.peek();
-            let is_bracket = matches!(next_char, Some(')') | Some(']') | Some('}') | Some('(') | Some('[') | Some('{'));
-            
+            let is_bracket = matches!(
+                next_char,
+                Some(')') | Some(']') | Some('}') | Some('(') | Some('[') | Some('{')
+            );
+
             if is_bracket {
-                // Closing bracket - truncate any extension
+                // Bracket line - truncate any extension, ignore indent mismatch
                 current.known_indent.truncate(base_len);
-            }else{
-                // Check for inconsistent indentation (mismatch within the prefix we should match)
-                if let Some(mm) = mismatch_at {
-                    // Mismatch at position mm - check if we're dedenting to a level <= mm
-                    // Find if any level has indent_len <= mm
-                    let valid_dedent = current.indent_stack.iter()
-                        .any(|l| l.indent_len <= mm);
-                    
-                    if !valid_dedent || new_len > mm {
-                        return Err(Error::new(
-                            Span::new(indent_start, new_len.max(1)),
-                            "Inconsistent indentation: whitespace pattern doesn't match previous levels",
-                        ));
-                    }
+            } else {
+                // Report indent mismatch now that we know it's not a bracket line
+                if indent_mismatch {
+                    errors.push(Error::new(
+                        Span::new(indent_start, new_len.max(1)),
+                        "Inconsistent indentation: whitespace pattern doesn't match previous levels",
+                    ));
                 }
 
-                // Pop levels where new_len is less than their indent_len
-                while let Some(top) = current.indent_stack.last() {
-                    if new_len < top.indent_len {
-                        // Dedenting past this level
-                        let finished = current.indent_stack.pop().unwrap();
-                        let parent_len = current.indent_stack.last().map(|l| l.indent_len).unwrap_or(0);
-                        current.known_indent.truncate(parent_len);
-                        finalize_indent_level(current, finished, pos);
-                    } else if new_len == top.indent_len {
-                        // Same level
-                        if !top.indented.is_empty() {
-                            // Had indented content = start new block
-                            let finished = current.indent_stack.pop().unwrap();
-                            let parent_len = current.indent_stack.last().map(|l| l.indent_len).unwrap_or(0);
-                            current.known_indent.truncate(parent_len);
-                            finalize_indent_level(current, finished, pos);
-                        } else {
-                            // Continue in same block, truncate any extension
-                            current.known_indent.truncate(new_len);
-                            break;
-                        }
-                    } else {
-                        // new_len > top.indent_len - deeper, will push below
-                        break;
-                    }
+                // Find if any level has indent_len <= new_len
+                let is_recognized_prefix = current.indent_stack.iter().any(|l| l.indent_len <= new_len);
+
+                if !is_recognized_prefix && !indent_mismatch {
+                    errors.push(Error::new(
+                        Span::new(indent_start, new_len.max(1)),
+                        "Inconsistent indentation: whitespace pattern doesn't match previous levels",
+                    ));
+                }
+
+                // While new len is less than previous indent levels, pop them
+                while let Some(top) = current.indent_stack.last()
+                    && new_len < top.indent_len
+                {
+                    current.pop_close_indent_level();
                 }
 
                 // Check if we need to create a new indent level
@@ -564,22 +547,20 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                 } else {
                     true // No levels yet
                 };
-                
+
                 if should_push {
                     current.indent_stack.push(IndentLevel {
                         indent_len: new_len,
-                        root_line: Vec::new(),
-                        indented: Vec::new(),
+                        line_start: 0,
+                        content: Vec::new(),
                         span_start: pos,
                     });
+                } else {
+                    // Staying at same level - update line_start to mark new line
+                    if let Some(top) = current.indent_stack.last_mut() {
+                        top.line_start = top.content.len();
+                    }
                 }
-            }
-
-            // Continue to parse the actual content
-            match chars.peek() {
-                None => break,
-                Some('\n') | Some('\r') => continue,
-                _ => {}
             }
         }
 
@@ -613,60 +594,36 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                 let paren_type = ParenType::from_open(c);
 
                 // Steal the previous token (if any) as the caller
-                let mut caller = {
-                    let current = invocation_stack.last_mut().unwrap();
-                    current.get_output().pop()
+                let mut caller: Toast = match end_list(&mut invocation_stack).pop() {
+                    Some(t) => t,
+                    None => {
+                        errors.push(Error::new(
+                            Span::new(pos, 1),
+                            format!("Opening '{}' requires a caller - nothing precedes it", c),
+                        ));
+                        Toast::Tokk(Tokk {
+                            span: Span::new(pos, 1),
+                            content: TokkV::Token("ERROR_DUMMY_TOKEN".into()),
+                        })
+                    }
                 };
 
-                // If no caller found and we're at a fresh indent level (nothing on this line yet),
-                // try stealing from the parent indent level. This handles:
-                //   foo
-                //     (bar)  -> becomes foo(bar) instead of Indental{foo, [(bar)]}
-                if caller.is_none() {
-                    let current = invocation_stack.last_mut().unwrap();
-                    if let Some(indent) = current.indent_stack.last() {
-                        // Check if current indent level is empty (we just increased indent)
-                        if indent.root_line.is_empty() && indent.indented.is_empty() {
-                            // Pop the empty indent level and steal from parent
-                            if current.indent_stack.len() >= 2 {
-                                current.indent_stack.pop(); // Remove empty level
-                                // Truncate known_indent to parent's length
-                                let new_len = current.indent_stack.last().map(|l| l.indent_len).unwrap_or(0);
-                                current.known_indent.truncate(new_len);
-                                // Now try to steal from parent level's root_line
-                                if let Some(parent) = current.indent_stack.last_mut() {
-                                    caller = parent.root_line.pop();
-                                    // Parent's state is fine - if it becomes empty, !indented.is_empty()
-                                    // will be false anyway
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Only allow None caller at file root level (invocation_stack.len() == 1)
-                // and only if we're not inside any indent structure
-                let at_file_root = invocation_stack.len() == 1;
-                if caller.is_none() && !at_file_root {
-                    return Err(Error::new(
-                        Span::new(pos, 1),
-                        format!("Opening '{}' requires a caller - nothing precedes it", c),
-                    ));
-                }
+                // there used to be code for looking up an indent level, but this actually can't work, an indent wouldn't be created if the opening thing were a paren, per the above.
 
                 // Adjust span_start to include the caller if present
-                let span_start = match &caller {
-                    Some(t) => t.span().start,
-                    None => pos,
-                };
+                let span_start = caller.span().start;
 
                 invocation_stack.push(InvocationLevel {
-                    paren_type: Some(paren_type),
+                    paren_type: paren_type,
                     caller,
                     span_start,
                     known_indent: String::new(),
-                    indent_stack: Vec::new(),
-                    content: Vec::new(),
+                    indent_stack: vec![IndentLevel {
+                        indent_len: 0,
+                        line_start: 0,
+                        content: Vec::new(),
+                        span_start: pos,
+                    }],
                 });
 
                 chars.next();
@@ -679,42 +636,51 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
 
                 // Check we're not trying to close the root
                 if invocation_stack.len() <= 1 {
-                    return Err(Error::new(
+                    errors.push(Error::new(
                         Span::new(pos, 1),
                         format!("Unmatched closing bracket: '{}'", c),
                     ));
+                    break;
                 }
 
-                let mut entry = invocation_stack.pop().unwrap();
-
                 // Check for matching paren type
-                let entry_type = entry.paren_type.unwrap(); // Safe: not root
-                if entry_type != expected_type {
-                    let expected_char = entry_type.close_char();
-                    return Err(Error::new(
+                let paren_type = invocation_stack.last().unwrap().paren_type; // Safe: not root
+                if paren_type != expected_type {
+                    let expected_char = paren_type.close_char();
+                    errors.push(Error::new(
                         Span::new(pos, 1),
                         format!(
                             "Mismatched bracket: expected '{}', found '{}'",
                             expected_char, c
                         ),
                     ));
+                    // and then I guess we just keep going...?
+                    // yeah I mean if someone closes this paren type later on that's a match and should be recognized... maybe? I dunno, it could produce a lot of very confusing errors, maybe it's bad design to show those. Okay fine I'll break.
+                    // continue;
+                    break;
                 }
 
                 // Flush any remaining indents inside this invocation
-                entry.flush_indents(pos);
+                let mut invocation_level = invocation_stack.pop().unwrap();
+                invocation_level.pop_all_indents(pos);
 
-                // Box the caller if present
-                let caller_boxed = entry.caller.map(Box::new);
+                let InvocationLevel {
+                    paren_type,
+                    caller,
+                    mut indent_stack,
+                    ..
+                } = invocation_level;
+                let content = indent_stack.drain(..).next().unwrap().content;
 
                 // Create the Invocation tokk
                 let tokk = Tokk {
-                    span: Span::from_range(entry.span_start, pos + 1),
-                    content: TokkV::Invocation(entry_type, caller_boxed, entry.content),
+                    span: Span::from_range(invocation_level.span_start, pos + 1),
+                    content: TokkV::Invocation(paren_type, Box::new(caller), content),
                 };
 
                 // Add to parent's output
                 let parent = invocation_stack.last_mut().unwrap();
-                parent.get_output().push(Toast::Tokk(tokk));
+                parent.end_list().push(Toast::Tokk(tokk));
 
                 chars.next();
                 pos += 1;
@@ -736,10 +702,11 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                 let mut value = String::new();
                 loop {
                     let Some(&ch) = chars.peek() else {
-                        return Err(Error::new(
+                        errors.push(Error::new(
                             Span::from_range(start, pos),
                             format!("Unclosed {} string literal", quote_char),
                         ));
+                        break;
                     };
 
                     if ch == quote_char {
@@ -753,10 +720,11 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                             chars.next();
                             pos += 1;
                             let Some(&escaped) = chars.peek() else {
-                                return Err(Error::new(
+                                errors.push(Error::new(
                                     Span::from_range(start, pos),
                                     format!("Unclosed {} string literal", quote_char),
                                 ));
+                                break;
                             };
                             let escaped_char = match escaped {
                                 'n' => '\n',
@@ -768,10 +736,11 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                                 '`' => '`',
                                 '0' => '\0',
                                 _ => {
-                                    return Err(Error::new(
+                                    errors.push(Error::new(
                                         Span::new(pos, 1),
                                         format!("Invalid escape sequence: \\{}", escaped),
                                     ));
+                                    escaped
                                 }
                             };
                             value.push(escaped_char);
@@ -804,8 +773,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                     span: Span::from_range(start, pos),
                     content: TokkV::Quoted(quote_type, value),
                 };
-                let current = invocation_stack.last_mut().unwrap();
-                current.get_output().push(Toast::Tokk(tokk));
+                end_list(&mut invocation_stack).push(Toast::Tokk(tokk));
             }
 
             // Check for operators
@@ -827,7 +795,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                     content: TokkV::Operator(op),
                 };
                 let current = invocation_stack.last_mut().unwrap();
-                current.get_output().push(Toast::Tokk(tokk));
+                current.end_list().push(Toast::Tokk(tokk));
             }
 
             // Comment
@@ -844,7 +812,13 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                     let mut content = String::from("#(");
 
                     while depth > 0 {
-                        let Some(ch) = chars.next() else { break };
+                        let Some(ch) = chars.next() else {
+                            errors.push(Error::new(
+                                Span::from_range(start, pos),
+                                "Unclosed multi-line comment",
+                            ));
+                            break 'entire;
+                        };
                         pos += 1;
                         content.push(ch);
                         match ch {
@@ -861,19 +835,11 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                         }
                     }
 
-                    if depth > 0 {
-                        return Err(Error::new(
-                            Span::from_range(start, pos),
-                            "Unclosed multi-line comment",
-                        ));
-                    }
-
                     let tokk = Tokk {
                         span: Span::from_range(start, pos),
                         content: TokkV::Token(content),
                     };
-                    let current = invocation_stack.last_mut().unwrap();
-                    current.get_output().push(Toast::Tokk(tokk));
+                    end_list(&mut invocation_stack).push(Toast::Tokk(tokk));
                 } else {
                     // Single-line comment
                     let mut content = String::from("#");
@@ -890,8 +856,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                         span: Span::from_range(start, pos),
                         content: TokkV::Token(content),
                     };
-                    let current = invocation_stack.last_mut().unwrap();
-                    current.get_output().push(Toast::Tokk(tokk));
+                    end_list(&mut invocation_stack).push(Toast::Tokk(tokk));
                 }
             }
 
@@ -927,8 +892,7 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
                         span: Span::from_range(start, pos),
                         content: TokkV::Token(value),
                     };
-                    let current = invocation_stack.last_mut().unwrap();
-                    current.get_output().push(Toast::Tokk(tokk));
+                    end_list(&mut invocation_stack).push(Toast::Tokk(tokk));
                 }
             }
         }
@@ -936,18 +900,23 @@ fn sequence(source: &str, operators: &OperatorTable) -> Result<Vec<Toast>, Error
 
     // Check for unclosed parens (any beyond the root)
     if invocation_stack.len() > 1 {
-        let entry = &invocation_stack[invocation_stack.len() - 1];
-        let paren_char = entry.paren_type.unwrap().close_char();
-        return Err(Error::new(
+        let entry = &invocation_stack.last().unwrap();
+        let paren_char = entry.paren_type.close_char();
+        errors.push(Error::new(
             Span::new(entry.span_start, 1),
             format!("Unclosed bracket: '{}'", paren_char),
         ));
     }
 
-    // Flush remaining indent stack in root and return its content
-    let mut root = invocation_stack.pop().unwrap();
-    root.flush_indents(pos);
-    Ok(root.content)
+    if !errors.is_empty() {
+        Err(errors)
+    } else {
+        // Collapse any remaining indent levels into Indentals
+        let mut root = invocation_stack.drain(..).next().unwrap();
+        root.pop_all_indents(pos);
+        // Return the content of the base indent level
+        Ok(root.indent_stack.drain(..).next().unwrap().content)
+    }
 }
 
 /// Token Or Ast
@@ -962,9 +931,9 @@ impl Toast {
             Toast::Tokk(tokk) => tokk,
             Toast::Ast(ast) => panic!("Toast is not a Tokk"),
         }
-    } 
+    }
     /// makes sure every toast is an ast
-    fn verify_ast(&self)-> Result<&Toast, Vec<Error>> {
+    fn verify_ast(&self) -> Result<&Toast, Vec<Error>> {
         let mut errors = Vec::new();
         self.verify_ast_writer(&mut errors);
         if errors.is_empty() {
@@ -976,46 +945,55 @@ impl Toast {
     fn verify_ast_writer(&self, errors: &mut Vec<Error>) {
         match self {
             Toast::Tokk(tokk) => errors.push(Error::new(tokk.span, "Toast is not an Ast")),
-            Toast::Ast(ast) => {
-                match &ast.v {
-                    ToastAstV::Invocation { parameters, .. } => {
-                        for p in parameters {
-                            p.verify_ast_writer(errors);
-                        }
+            Toast::Ast(ast) => match &ast.v {
+                ToastAstV::Invocation { parameters, .. } => {
+                    for p in parameters {
+                        p.verify_ast_writer(errors);
                     }
-                    ToastAstV::Conditional { condition, then, elsen, elsifs, .. } => {
-                            condition.verify_ast_writer(errors);
-                        then.verify_ast_writer(errors);
-                        if let Some(e) = elsen {
-                            e.verify_ast_writer(errors);
-                        }
-                        for (c, b) in elsifs {
-                            c.verify_ast_writer(errors);
-                            b.verify_ast_writer(errors);
-                        }
-                    }
-                    ToastAstV::Function { args, return_type, body, .. } => {
-                        for arg in args {
-                            arg.verify_ast_writer(errors);
-                        }
-                        if let Some(r) = return_type {
-                            r.verify_ast_writer(errors);
-                        }
-                        body.verify_ast_writer(errors);
-                    }
-                    ToastAstV::Block { statements, .. } => {
-                        for st in statements {
-                            st.verify_ast_writer(errors);
-                        }
-                    }
-                    ToastAstV::Operator { arguments, .. } => {
-                        for a in arguments {
-                            a.verify_ast_writer(errors);
-                        }
-                    }
-                    _ => {},
                 }
-            }
+                ToastAstV::Conditional {
+                    condition,
+                    then,
+                    elsen,
+                    elsifs,
+                    ..
+                } => {
+                    condition.verify_ast_writer(errors);
+                    then.verify_ast_writer(errors);
+                    if let Some(e) = elsen {
+                        e.verify_ast_writer(errors);
+                    }
+                    for (c, b) in elsifs {
+                        c.verify_ast_writer(errors);
+                        b.verify_ast_writer(errors);
+                    }
+                }
+                ToastAstV::Function {
+                    args,
+                    return_type,
+                    body,
+                    ..
+                } => {
+                    for arg in args {
+                        arg.verify_ast_writer(errors);
+                    }
+                    if let Some(r) = return_type {
+                        r.verify_ast_writer(errors);
+                    }
+                    body.verify_ast_writer(errors);
+                }
+                ToastAstV::Block { statements, .. } => {
+                    for st in statements {
+                        st.verify_ast_writer(errors);
+                    }
+                }
+                ToastAstV::Operator { arguments, .. } => {
+                    for a in arguments {
+                        a.verify_ast_writer(errors);
+                    }
+                }
+                _ => {}
+            },
         }
     }
     fn span(&self) -> Span {
@@ -1076,7 +1054,6 @@ pub enum ToastAstV {
         arguments: Vec<Box<Toast>>,
     },
 }
-
 
 /**
 the astrule step takes a sequence of [Toast]s that are initially all [Tokk]s and applies some rewrite rules to transform them into [Ast] Toasts, which are then stripped down into a tree of pure Asts.
@@ -1146,170 +1123,223 @@ to ast::Function(parameters:[$parameters*] returnType:$return body:[$doings*])
 After this, in Result, all [Toast]s should be [ToastAst]s, no [Tokk]s should remain.
 */
 
-fn structure(mut tokks: Vec<Toast>, operators:&[String], operator_table: &OperatorTable) -> Result<(), Vec<Error>> {
-    let mut errors = Vec::new();
-    structure_series(&mut tokks, operators, operator_table, &mut errors);
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(errors)
-    }
-}
+// converts every toast into a ToastAst, or reports errors
+// fn structure(
+//     tokks: &mut Vec<Toast>,
+//     operators: &[String],
+//     operator_table: &OperatorTable,
+// ) -> Result<(), Vec<Error>> {
+//     let mut errors = Vec::new();
+//     structure_series(&mut tokks, operators, operator_table, &mut errors);
+//     if errors.is_empty() {
+//         Ok(())
+//     } else {
+//         Err(errors)
+//     }
+// }
 
 // status: I'm a bit burned out. It turns out that it's not going to be efficient to apply rules one after the other, so the conversion algorithm is going to be a lot less elegant than the spec, and proving that the algorithm agrees with the spec is cognitively draining.
 // well, If I can prove to myself that the faster code version of this is equivalent to applying rewrite rules in multiple passes, then I'm pretty sure that'd imply that a sufficiently smart rule applyer could also produce that code, so even if we don't have that now, it can probably be found later. So it's fine.
 
-fn structure_series(toasts: &mut Vec<Toast>, operators: &[String], operator_table: &OperatorTable, errors: &mut Vec<Error>) {
-    for toast in toasts {
-        structure_individual(toast, operators, operator_table, errors);
-    }
-    // TODO: look for operators and if else sequences (Pratt parsing goes here)
-}
-fn structure_individual(toast: &mut Toast, operators: &[String], operator_table: &OperatorTable, errors: &mut Vec<Error>) {
-    match toast {
-        Toast::Tokk(tokk) => {
-            // Convert Tokk to ToastAst based on the rules
-            let span = tokk.span;
-            let new_ast = match &mut tokk.content {
-                // Tokens become atoms: for $x:Token → ast::Atom($x)
-                TokkV::Token(s) => ToastAst {
-                    span,
-                    v: ToastAstV::Atom { span, value: take(s) },
-                },
-                // Operators stay as operators (will be processed by Pratt parsing)
-                TokkV::Operator(s) => ToastAst {
-                    span,
-                    v: ToastAstV::Operator { span, operator: take(s), arguments: Vec::new() },
-                },
-                // Backtick quotes become atoms: for $x:Quoted(Backticked) → ast::Atom($x)
-                TokkV::Quoted(QuoteType::Backtick, s) => ToastAst {
-                    span,
-                    v: ToastAstV::Atom { span, value: take(s) },
-                },
-                // Other quotes stay as quoted
-                TokkV::Quoted(quote_type, s) => ToastAst {
-                    span,
-                    v: ToastAstV::Quoted { span, quote_type: *quote_type, value: take(s) },
-                },
-                // Invocations: convert to ast::Invocation and recurse into arguments
-                TokkV::Invocation(paren_type, caller, args) => {
-                    let head = caller.as_ref().map(|c| {
-                        match c.as_ref() {
-                            Toast::Tokk(Tokk { content: TokkV::Token(s), .. }) => s.clone(),
-                            _ => String::new(),
-                        }
-                    }).unwrap_or_default();
-                    let kind = *paren_type;
-                    let mut parameters: Vec<Box<Toast>> = take(args)
-                        .into_iter()
-                        .map(Box::new)
-                        .collect();
-                    // Recurse into each parameter
-                    for param in &mut parameters {
-                        structure_individual(param, operators, operator_table, errors);
-                    }
-                    ToastAst {
-                        span,
-                        v: ToastAstV::Invocation { span, head, kind, parameters },
-                    }
-                },
-                // Indentals: these need special handling based on the rules
-                TokkV::Indental { root_line, indented } => {
-                    // For now, convert to an invocation with root_line as head context
-                    // and indented as body - this matches %indental patterns
-                    let mut root_params: Vec<Box<Toast>> = take(root_line)
-                        .into_iter()
-                        .map(Box::new)
-                        .collect();
-                    let mut indented_params: Vec<Box<Toast>> = take(indented)
-                        .into_iter()
-                        .map(Box::new)
-                        .collect();
-                    
-                    // Recurse into root_line and indented toasts
-                    for param in &mut root_params {
-                        structure_individual(param, operators, operator_table, errors);
-                    }
-                    for param in &mut indented_params {
-                        structure_individual(param, operators, operator_table, errors);
-                    }
-                    
-                    // Combine all parameters - indental becomes an invocation
-                    let mut all_params = root_params;
-                    all_params.extend(indented_params);
-                    
-                    // Try to extract head from first token if available
-                    let head = all_params.first().and_then(|p| {
-                        match p.as_ref() {
-                            Toast::Ast(ToastAst { v: ToastAstV::Atom { value, .. }, .. }) => Some(value.clone()),
-                            _ => None,
-                        }
-                    }).unwrap_or_default();
-                    
-                    ToastAst {
-                        span,
-                        v: ToastAstV::Invocation { span, head, kind: ParenType::Round, parameters: all_params },
-                    }
-                },
-            };
-            *toast = Toast::Ast(new_ast);
-        }
-        Toast::Ast(ast) => {
-            // no conversion, just recurses
-            match &mut ast.v {
-                ToastAstV::Invocation { parameters, .. } => {
-                    for param in parameters {
-                        structure_individual(param, operators, operator_table, errors);
-                    }
-                }
-                ToastAstV::Conditional { condition, then, elsen, elsifs, .. } => {
-                    structure_individual(condition, operators, operator_table, errors);
-                    structure_individual(then, operators, operator_table, errors);
-                    if let Some(e) = elsen {
-                        structure_individual(e, operators, operator_table, errors);
-                    }
-                    for (cond, body) in elsifs {
-                        structure_individual(cond, operators, operator_table, errors);
-                        structure_individual(body, operators, operator_table, errors);
-                    }
-                }
-                ToastAstV::Function { args, return_type, body, .. } => {
-                    for arg in args {
-                        structure_individual(arg, operators, operator_table, errors);
-                    }
-                    if let Some(ret) = return_type {
-                        structure_individual(ret, operators, operator_table, errors);
-                    }
-                    structure_individual(body, operators, operator_table, errors);
-                }
-                ToastAstV::Block { statements, .. } => {
-                    for stmt in statements {
-                        structure_individual(stmt, operators, operator_table, errors);
-                    }
-                }
-                ToastAstV::Operator { arguments, .. } => {
-                    for arg in arguments {
-                        structure_individual(arg, operators, operator_table, errors);
-                    }
-                }
-                // Leaf nodes - no children to recurse into
-                ToastAstV::Comment { .. } | ToastAstV::Atom { .. } | ToastAstV::Quoted { .. } => {}
-            }
-        }
-    }
-}
+// fn structure_series(
+//     toasts: &mut Vec<Toast>,
+//     operators: &[String],
+//     operator_table: &OperatorTable,
+//     errors: &mut Vec<Error>,
+// ) {
+//     for toast in toasts {
+//         structure_individual(toast, operators, operator_table, errors);
+//     }
+//     // TODO: look for operators and if else sequences (Pratt parsing goes here)
+// }
+// fn structure_individual(
+//     toast: &mut Toast,
+//     operators: &[String],
+//     operator_table: &OperatorTable,
+//     errors: &mut Vec<Error>,
+// ) {
+//     match toast {
+//         Toast::Tokk(tokk) => {
+//             // Convert Tokk to ToastAst based on the rules
+//             let span = tokk.span;
+//             let new_ast = match &mut tokk.content {
+//                 // Tokens become atoms: for $x:Token → ast::Atom($x)
+//                 TokkV::Token(s) => ToastAst {
+//                     span,
+//                     v: ToastAstV::Atom {
+//                         span,
+//                         value: take(s),
+//                     },
+//                 },
+//                 // Operators stay as operators (will be processed by Pratt parsing)
+//                 TokkV::Operator(s) => ToastAst {
+//                     span,
+//                     v: ToastAstV::Operator {
+//                         span,
+//                         operator: take(s),
+//                         arguments: Vec::new(),
+//                     },
+//                 },
+//                 // Backtick quotes become atoms: for $x:Quoted(Backticked) → ast::Atom($x)
+//                 TokkV::Quoted(QuoteType::Backtick, s) => ToastAst {
+//                     span,
+//                     v: ToastAstV::Atom {
+//                         span,
+//                         value: take(s),
+//                     },
+//                 },
+//                 // Other quotes stay as quoted
+//                 TokkV::Quoted(quote_type, s) => ToastAst {
+//                     span,
+//                     v: ToastAstV::Quoted {
+//                         span,
+//                         quote_type: *quote_type,
+//                         value: take(s),
+//                     },
+//                 },
+//                 // Invocations: convert to ast::Invocation and recurse into arguments
+//                 TokkV::Invocation(paren_type, caller, args) => {
+//                     let head = caller
+//                         .as_mut_ref()
+//                         .map(|c| match c.as_ref() {
+//                             Toast::Tokk(Tokk {
+//                                 content: TokkV::Token(s),
+//                                 ..
+//                             }) => s.clone(),
+//                             _ => String::new(),
+//                         })
+//                         .unwrap_or_default();
+//                     let kind = *paren_type;
+//                     let mut parameters: Vec<Box<Toast>> =
+//                         take(args).into_iter().map(Box::new).collect();
+//                     // Recurse into each parameter
+//                     for param in &mut parameters {
+//                         structure_individual(param, operators, operator_table, errors);
+//                     }
+//                     ToastAst {
+//                         span,
+//                         v: ToastAstV::Invocation {
+//                             span,
+//                             head,
+//                             kind,
+//                             parameters,
+//                         },
+//                     }
+//                 }
+//                 // Indentals: these need special handling based on the rules
+//                 TokkV::Indental {
+//                     root_line,
+//                     indented,
+//                 } => {
+//                     // For now, convert to an invocation with root_line as head context
+//                     // and indented as body - this matches %indental patterns
+//                     let mut root_params: Vec<Box<Toast>> =
+//                         take(root_line).into_iter().map(Box::new).collect();
+//                     let mut indented_params: Vec<Box<Toast>> =
+//                         take(indented).into_iter().map(Box::new).collect();
+
+//                     // Recurse into root_line and indented toasts
+//                     for param in &mut root_params {
+//                         structure_individual(param, operators, operator_table, errors);
+//                     }
+//                     for param in &mut indented_params {
+//                         structure_individual(param, operators, operator_table, errors);
+//                     }
+
+//                     // Combine all parameters - indental becomes an invocation
+//                     let mut all_params = root_params;
+//                     all_params.extend(indented_params);
+
+//                     // Try to extract head from first token if available
+//                     let head = all_params
+//                         .first()
+//                         .and_then(|p| match p.as_ref() {
+//                             Toast::Ast(ToastAst {
+//                                 v: ToastAstV::Atom { value, .. },
+//                                 ..
+//                             }) => Some(value.clone()),
+//                             _ => None,
+//                         })
+//                         .unwrap_or_default();
+
+//                     ToastAst {
+//                         span,
+//                         v: ToastAstV::Invocation {
+//                             span,
+//                             head,
+//                             kind: ParenType::Round,
+//                             parameters: all_params,
+//                         },
+//                     }
+//                 }
+//             };
+//             *toast = Toast::Ast(new_ast);
+//         }
+//         Toast::Ast(ast) => {
+//             // no conversion, just recurses
+//             match &mut ast.v {
+//                 ToastAstV::Invocation { parameters, .. } => {
+//                     for param in parameters {
+//                         structure_individual(param, operators, operator_table, errors);
+//                     }
+//                 }
+//                 ToastAstV::Conditional {
+//                     condition,
+//                     then,
+//                     elsen,
+//                     elsifs,
+//                     ..
+//                 } => {
+//                     structure_individual(condition, operators, operator_table, errors);
+//                     structure_individual(then, operators, operator_table, errors);
+//                     if let Some(e) = elsen {
+//                         structure_individual(e, operators, operator_table, errors);
+//                     }
+//                     for (cond, body) in elsifs {
+//                         structure_individual(cond, operators, operator_table, errors);
+//                         structure_individual(body, operators, operator_table, errors);
+//                     }
+//                 }
+//                 ToastAstV::Function {
+//                     args,
+//                     return_type,
+//                     body,
+//                     ..
+//                 } => {
+//                     for arg in args {
+//                         structure_individual(arg, operators, operator_table, errors);
+//                     }
+//                     if let Some(ret) = return_type {
+//                         structure_individual(ret, operators, operator_table, errors);
+//                     }
+//                     structure_individual(body, operators, operator_table, errors);
+//                 }
+//                 ToastAstV::Block { statements, .. } => {
+//                     for stmt in statements {
+//                         structure_individual(stmt, operators, operator_table, errors);
+//                     }
+//                 }
+//                 ToastAstV::Operator { arguments, .. } => {
+//                     for arg in arguments {
+//                         structure_individual(arg, operators, operator_table, errors);
+//                     }
+//                 }
+//                 // Leaf nodes - no children to recurse into
+//                 ToastAstV::Comment { .. } | ToastAstV::Atom { .. } | ToastAstV::Quoted { .. } => {}
+//             }
+//         }
+//     }
+// }
 
 // struct Alteration<'a> {
 //     remove: Vec<TastID>,
 //     replacement: Box<Ast>,
 // }
 
-
-
 /// matches against any of the keywords
 struct KeywordRule {
     keywords: Vec<String>,
-    rule: fn(t:& mut Toast) -> Result<Toast, Error>,
+    rule: fn(t: &mut Toast) -> Result<Toast, Error>,
 }
 
 /// operators are ordered from highest to lowest precedence
@@ -1321,26 +1351,24 @@ struct KeywordRule {
 
 // fn parse_language(content: &str)-> Result<Arena, Error> {
 //     parse(content, &[
-//         ".".into(),
-//         ":".into(),
-//         "@".into(),
-//         "/".into(),
-//         "*".into(),
-//         "-".into(),
-//         "+".into(),
-//         "==".into(),
-//         "!=".into(),
-//         "<".into(),
-//         ">".into(),
-//         "<=".into(),
-//         ">=".into(),
-//         "&&".into(),
-//         "||".into(),
 //         "=".into(),
+//         "||".into(),
+//         "&&".into(),
+//         "!=".into(),
+//         "==".into(),
+//         "+".into(),
+//         "-".into(),
+//         "*".into(),
+//         "/".into(),
+//         ">".into(),
+//         "<".into(),
+//         ">=".into(),
+//         "<=".into(),
+//         ":".into(),
+//         ".".into(),
 //     ],
 //     &[])
 // }
-
 
 // ============================================================================
 // Tests
@@ -1357,8 +1385,14 @@ mod tests {
     /// Helper to extract token or operator string from Toast
     fn as_token(tokk: &Toast) -> Option<&str> {
         match &tokk {
-            Toast::Tokk(Tokk { content: TokkV::Token(s), .. }) => Some(s),
-            Toast::Tokk(Tokk { content: TokkV::Operator(s), .. }) => Some(s),
+            Toast::Tokk(Tokk {
+                content: TokkV::Token(s),
+                ..
+            }) => Some(s),
+            Toast::Tokk(Tokk {
+                content: TokkV::Operator(s),
+                ..
+            }) => Some(s),
             _ => None,
         }
     }
@@ -1366,7 +1400,10 @@ mod tests {
     /// Helper to extract operator string from Toast
     fn as_operator(tokk: &Toast) -> Option<&str> {
         match &tokk {
-            Toast::Tokk(Tokk { content: TokkV::Operator(s), .. }) => Some(s),
+            Toast::Tokk(Tokk {
+                content: TokkV::Operator(s),
+                ..
+            }) => Some(s),
             _ => None,
         }
     }
@@ -1383,17 +1420,21 @@ mod tests {
     /// Helper to extract quoted string from tokk
     fn as_quoted(tokk: &Toast) -> Option<(QuoteType, &str)> {
         match &tokk {
-            Toast::Tokk(Tokk { content: TokkV::Quoted(qt, s), .. }) => Some((*qt, s)),
+            Toast::Tokk(Tokk {
+                content: TokkV::Quoted(qt, s),
+                ..
+            }) => Some((*qt, s)),
             _ => None,
         }
     }
 
     /// Helper to extract invocation content from tokk
-    fn as_invocation(tokk: &Toast) -> (ParenType, Option<&Toast>, &Vec<Toast>) {
+    fn as_invocation(tokk: &Toast) -> (ParenType, &Toast, &Vec<Toast>) {
         match &tokk {
-            Toast::Tokk(Tokk { content: TokkV::Invocation(pt, caller, content), .. }) => {
-                (*pt, caller.as_ref().map(|b| b.as_ref()), content)
-            }
+            Toast::Tokk(Tokk {
+                content: TokkV::Invocation(pt, caller, content),
+                ..
+            }) => (*pt, caller, &content),
             _ => panic!("Toast is not an Invocation"),
         }
     }
@@ -1401,20 +1442,56 @@ mod tests {
     /// Helper to extract indental from tokk
     fn as_indental(tokk: &Toast) -> Option<(&Vec<Toast>, &Vec<Toast>)> {
         match &tokk {
-            Toast::Tokk(Tokk { content: TokkV::Indental { root_line, indented }, .. }) => Some((root_line, indented)),
+            Toast::Tokk(Tokk {
+                content:
+                    TokkV::Indental {
+                        root_line,
+                        indented,
+                    },
+                ..
+            }) => Some((root_line, indented)),
             _ => None,
         }
     }
 
     fn make_operator_table() -> OperatorTable {
-        OperatorTable::from_precedence_list(vec![
-            "=".to_string(),
-            "+".to_string(),
-            "-".to_string(),
-            "*".to_string(),
-            "/".to_string(),
-            ":".to_string(),
-            ".".to_string(),
+        OperatorTable::new(vec![
+            // Assignment (lowest precedence, right-associative)
+            ("=".into(), BindingInfo::right_assoc(1)),
+            ("+=".into(), BindingInfo::right_assoc(1)),
+            ("-=".into(), BindingInfo::right_assoc(1)),
+            ("*=".into(), BindingInfo::right_assoc(1)),
+            ("/=".into(), BindingInfo::right_assoc(1)),
+            ("??=".into(), BindingInfo::right_assoc(1)),
+            // Null coalescing
+            ("??".into(), BindingInfo::right_assoc(2)),
+            // Logical
+            ("||".into(), BindingInfo::left_assoc(3)),
+            ("&&".into(), BindingInfo::left_assoc(4)),
+            // Equality
+            ("==".into(), BindingInfo::left_assoc(5)),
+            ("!=".into(), BindingInfo::left_assoc(5)),
+            // Comparison
+            ("<".into(), BindingInfo::left_assoc(6)),
+            (">".into(), BindingInfo::left_assoc(6)),
+            ("<=".into(), BindingInfo::left_assoc(6)),
+            (">=".into(), BindingInfo::left_assoc(6)),
+            // Additive
+            ("+".into(), BindingInfo::left_assoc(7)),
+            ("-".into(), BindingInfo::left_assoc(7)),
+            // Multiplicative
+            ("*".into(), BindingInfo::left_assoc(8)),
+            ("/".into(), BindingInfo::left_assoc(8)),
+            // Type annotation
+            (":".into(), BindingInfo::left_assoc(9)),
+            // Optional chaining
+            ("??.".into(), BindingInfo::left_assoc(10)),
+            (".?".into(), BindingInfo::left_assoc(10)),
+            // Member access (highest binary precedence)
+            (".".into(), BindingInfo::left_assoc(11)),
+            // Unary prefix
+            ("!".into(), BindingInfo::prefix()),
+            ("?".into(), BindingInfo::prefix()),
         ])
     }
 
@@ -1446,8 +1523,7 @@ mod tests {
 
         let (paren_type, caller, content) = as_invocation(&tokks[0]);
         assert!(matches!(paren_type, ParenType::Round));
-        assert!(caller.is_some());
-        assert_eq!(as_token(caller.unwrap()), Some("foo"));
+        assert_eq!(as_token(caller), Some("foo"));
         assert_eq!(content.len(), 1);
         assert_eq!(as_token(&content[0]), Some("bar"));
     }
@@ -1461,25 +1537,16 @@ mod tests {
 
         let (paren_type, caller, content) = as_invocation(&tokks[0]);
         assert!(matches!(paren_type, ParenType::Square));
-        assert!(caller.is_some());
-        assert_eq!(as_token(caller.unwrap()), Some("arr"));
+        assert_eq!(as_token(caller), Some("arr"));
         assert_eq!(content.len(), 1);
         assert_eq!(as_token(&content[0]), Some("0"));
     }
 
     #[test]
-    fn test_tokenize_curly_brackets() {
+    fn test_tokenize_curly_brackets_no_caller() {
         let ops = make_operator_table();
-        let tokks = sequence("{a b}", &ops).expect("should tokenize");
-        // {a b} has no caller
-        assert_eq!(tokks.len(), 1);
-
-        let (paren_type, caller, content) = as_invocation(&tokks[0]);
-        assert!(matches!(paren_type, ParenType::Curly));
-        assert!(caller.is_none());
-        assert_eq!(content.len(), 2);
-        assert_eq!(as_token(&content[0]), Some("a"));
-        assert_eq!(as_token(&content[1]), Some("b"));
+        // Curly bracket without caller should be an error
+        assert!(sequence("{a b}", &ops).is_err());
     }
 
     #[test]
@@ -1488,7 +1555,7 @@ mod tests {
         let result = sequence("(a]", &ops);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("Mismatched"));
+        assert!(err.iter().any(|e| e.message.contains("Mismatched")));
     }
 
     #[test]
@@ -1497,7 +1564,7 @@ mod tests {
         let result = sequence("(a b", &ops);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("Unclosed"));
+        assert!(err.iter().any(|e| e.message.contains("Unclosed")));
     }
 
     #[test]
@@ -1506,7 +1573,7 @@ mod tests {
         let result = sequence("a)", &ops);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("Unmatched"));
+        assert!(err.iter().any(|e| e.message.contains("Unmatched")));
     }
 
     #[test]
@@ -1595,14 +1662,12 @@ mod tests {
         assert_eq!(scrips.len(), 1);
 
         let (_, outer_caller, outer_content) = as_invocation(&scrips[0]);
-        assert!(outer_caller.is_some());
-        assert_eq!(as_token(outer_caller.unwrap()), Some("f"));
+        assert_eq!(as_token(outer_caller), Some("f"));
         // Inside f(...) we have g(x) which is one invocation
         assert_eq!(outer_content.len(), 1);
 
         let (_, inner_caller, inner_content) = as_invocation(&outer_content[0]);
-        assert!(inner_caller.is_some());
-        assert_eq!(as_token(inner_caller.unwrap()), Some("g"));
+        assert_eq!(as_token(inner_caller), Some("g"));
         assert_eq!(inner_content.len(), 1);
         assert_eq!(as_token(&inner_content[0]), Some("x"));
     }
@@ -1634,8 +1699,7 @@ mod tests {
         assert_eq!(scrips.len(), 1);
 
         let (_, caller, content) = as_invocation(&scrips[0]);
-        assert!(caller.is_some());
-        assert_eq!(as_token(caller.unwrap()), Some("f"));
+        assert_eq!(as_token(caller), Some("f"));
         // a and b at same indent level should be flat
         assert_eq!(content.len(), 2);
         assert_eq!(as_token(&content[0]), Some("a"));
@@ -1652,8 +1716,7 @@ mod tests {
         assert_eq!(scrips.len(), 1);
 
         let (_, caller, content) = as_invocation(&scrips[0]);
-        assert!(caller.is_some());
-        assert_eq!(as_token(caller.unwrap()), Some("f"));
+        assert_eq!(as_token(caller), Some("f"));
         // a with indented b should form an Indental inside the invocation
         assert_eq!(content.len(), 1);
         let (root_line, indented) = as_indental(&content[0]).expect("should be indental");
@@ -1675,9 +1738,10 @@ mod tests {
 
         // indented should have: Indental(b -> [c, d]), e
         assert_eq!(indented.len(), 2);
-        
+
         // First is nested indental
-        let (inner_root, inner_indented) = as_indental(&indented[0]).expect("should be nested indental");
+        let (inner_root, inner_indented) =
+            as_indental(&indented[0]).expect("should be nested indental");
         assert_eq!(inner_root.len(), 1);
         assert_eq!(as_token(&inner_root[0]), Some("b"));
         assert_eq!(inner_indented.len(), 2);
@@ -1793,12 +1857,11 @@ mod tests {
         let (root_line, indented) = as_indental(&scrips[0]).expect("should be indental");
 
         assert_eq!(as_token(&root_line[0]), Some("a"));
-        
+
         // indented has: f(x) as one invocation, then b
         assert_eq!(indented.len(), 2);
         let (_, caller, content) = as_invocation(&indented[0]);
-        assert!(caller.is_some());
-        assert_eq!(as_token(caller.unwrap()), Some("f"));
+        assert_eq!(as_token(caller), Some("f"));
         assert_eq!(as_token(&content[0]), Some("x"));
         assert_eq!(as_token(&indented[1]), Some("b"));
     }
@@ -1806,7 +1869,9 @@ mod tests {
     #[test]
     fn test_tokenize_deeply_nested_indent() {
         let ops = make_operator_table();
-        let scrips = sequence("a\n  b\n    c\n      d", &ops).expect("should tokenize");
+        let scripsr = sequence("a\n  b\n    c\n      d", &ops);
+        println!("{:?}", scripsr);
+        let scrips = scripsr.expect("should tokenize");
 
         // a -> [b -> [c -> [d]]]
         assert_eq!(scrips.len(), 1);
@@ -1829,7 +1894,7 @@ mod tests {
         let result = sequence("a\n  b\n\tc", &ops);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("Inconsistent indentation"));
+        assert!(err.iter().any(|e| e.message.contains("Inconsistent indentation")));
     }
 
     #[test]
@@ -1845,10 +1910,9 @@ mod tests {
 
         // indented has: b(...) as one invocation, then c
         assert_eq!(indented.len(), 2);
-        
+
         let (_, caller, paren_content) = as_invocation(&indented[0]);
-        assert!(caller.is_some());
-        assert_eq!(as_token(caller.unwrap()), Some("b"));
+        assert_eq!(as_token(caller), Some("b"));
         // Inside invocation: x -> [y] using tab indentation
         assert_eq!(paren_content.len(), 1);
         let (inner_root, inner_indented) = as_indental(&paren_content[0]).expect("inner indental");
@@ -1866,17 +1930,15 @@ mod tests {
         let result = sequence("f(\n  a\n\tb\n)", &ops);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("Inconsistent indentation"));
+        assert!(err.iter().any(|e| e.message.contains("Inconsistent indentation")));
     }
-    
-    
 
     #[test]
     fn test_tokenize_prefix_indent_works() {
         let ops = make_operator_table();
         // First level is 2 spaces, second level is 4 spaces (extends the first)
         let scrips = sequence("a\n  b\n    c", &ops).expect("should tokenize");
-
+        println!("{:?}", scrips);
         assert_eq!(scrips.len(), 1);
         let (r1, i1) = as_indental(&scrips[0]).expect("level 1");
         assert_eq!(as_token(&r1[0]), Some("a"));
@@ -1909,17 +1971,17 @@ mod tests {
         let scrips = sequence("a\n  b\n    c\nd", &ops).expect("should tokenize");
 
         assert_eq!(scrips.len(), 2);
-        
+
         // First is the indental structure
         let (r1, i1) = as_indental(&scrips[0]).expect("outer indental");
         assert_eq!(as_token(&r1[0]), Some("a"));
-        
+
         // Inside a's indented: b with c indented under it
         assert_eq!(i1.len(), 1);
         let (r2, i2) = as_indental(&i1[0]).expect("inner indental");
         assert_eq!(as_token(&r2[0]), Some("b"));
         assert_eq!(as_token(&i2[0]), Some("c"));
-        
+
         // Second is d at root level
         assert_eq!(as_token(&scrips[1]), Some("d"));
     }
@@ -1931,7 +1993,7 @@ mod tests {
         let result = sequence("f(\n  (x)\n)", &ops);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("requires a caller"));
+        assert!(err.iter().any(|e| e.message.contains("requires a caller")));
     }
 
     #[test]
@@ -1944,8 +2006,7 @@ mod tests {
         // Should be one invocation with caller=foo
         assert_eq!(scrips.len(), 1);
         let (_, caller, content) = as_invocation(&scrips[0]);
-        assert!(caller.is_some());
-        assert_eq!(as_token(caller.unwrap()), Some("foo"));
+        assert_eq!(as_token(caller), Some("foo"));
         assert_eq!(content.len(), 1);
         assert_eq!(as_token(&content[0]), Some("bar"));
     }
@@ -1958,25 +2019,11 @@ mod tests {
 
         assert_eq!(scrips.len(), 1);
         let (_, caller, content) = as_invocation(&scrips[0]);
-        assert!(caller.is_some());
-        assert_eq!(as_token(caller.unwrap()), Some("foo"));
+        assert_eq!(as_token(caller), Some("foo"));
         assert_eq!(content.len(), 3);
         assert_eq!(as_token(&content[0]), Some("a"));
         assert_eq!(as_token(&content[1]), Some("b"));
         assert_eq!(as_token(&content[2]), Some("c"));
-    }
-
-    #[test]
-    fn test_tokenize_curly_at_root_no_caller_ok() {
-        let ops = make_operator_table();
-        // At file root level, a paren/curly with no caller is allowed
-        let scrips = sequence("{a b}", &ops).expect("should tokenize");
-
-        assert_eq!(scrips.len(), 1);
-        let (paren_type, caller, content) = as_invocation(&scrips[0]);
-        assert!(matches!(paren_type, ParenType::Curly));
-        assert!(caller.is_none()); // No caller at root is OK
-        assert_eq!(content.len(), 2);
     }
 
     #[test]
@@ -1985,11 +2032,11 @@ mod tests {
         // g(x) inside f() is OK because g is the caller
         let scrips = sequence("f(g(x))", &ops).expect("should tokenize");
         assert_eq!(scrips.len(), 1);
-        
+
         // But ((x)) should fail because inner ( has no caller
         let result = sequence("f((x))", &ops);
         assert!(result.is_err());
         let err = result.unwrap_err();
-        assert!(err.message.contains("requires a caller"));
+        assert!(err.iter().any(|e| e.message.contains("requires a caller")));
     }
 }
