@@ -2,7 +2,7 @@ Attempts to make a programming language. Starting with The Perfect Syntax.
 
 Why was I doing this? I want a better web. A better web wants a shared language of types, a way of saying what a thing is, which then tells your databrowser/agent how to represent it to you and what can be done with it. This type system needs to be better than most type systems in a specific way: It needs ot be collision-free. Any two types need to be combinable. Which is to say, it needs to have ways of resolving ambiguity from name collisions, and it needs to not have the diamond problem, and it may need to support a weird way of solving it where it can have two instances of the colliding supertype.
 
-No high level programming language's type system supports these things. That doesn't mean they wouldn't be able to fairly frictionlessly use bindings to these types. But it means that there'd be no language for which the integration is direct and complete and beautiful.
+No high level programming language's type system supports these things. That doesn't mean they wouldn't be able to fairly frictionlessly use bindings to these types. But it means that there'd be no language for which the integration is direct and complete and beautiful. But also, if you define a language for types, which we need to do, then you're most of the way to having a programming language (the rest can mostly be imported from other programming languages or compiler chains)
 
 So I want to make a programming language.
 
